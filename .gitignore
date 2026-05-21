@@ -1,0 +1,19 @@
+# Build output
+build*/
+out/
+
+# CMake user presets (contain local machine paths — configure manually)
+CMakeUserPresets.json
+
+# Visual Studio
+.vs/
+*.user
+*.VC.db
+*.VC.opendb
+
+# Claude Code settings
+.claude/
+
+# Windows
+Thumbs.db
+Desktop.ini

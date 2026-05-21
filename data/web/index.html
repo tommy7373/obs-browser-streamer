@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OBS Web Preview</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #111;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    font-family: sans-serif;
+  }
+  h1 { color: #ccc; font-size: 36px; font-weight: normal; margin-bottom: 56px; letter-spacing: 2px; }
+  #streams { display: flex; flex-direction: column; align-items: center; gap: 28px; }
+  .stream-btn {
+    display: block;
+    width: 520px;
+    max-width: 90vw;
+    padding: 40px 48px;
+    background: #222;
+    color: #fff;
+    font-size: 44px;
+    font-weight: bold;
+    text-align: center;
+    border-radius: 28px;
+    text-decoration: none;
+    border: 4px solid #333;
+    transition: background .15s, border-color .15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .stream-btn:hover  { background: #2a2a2a; border-color: #555; }
+  .stream-btn:active { background: #3a3a3a; }
+  #msg { color: #666; font-size: 30px; }
+</style>
+</head>
+<body>
+<h1>OBS Web Preview</h1>
+<div id="streams"><p id="msg">Loading…</p></div>
+<script>
+(function poll() {
+  fetch('/streams')
+    .then(r => r.json())
+    .then(streams => {
+      var div = document.getElementById('streams');
+      if (streams.length === 0) {
+        div.innerHTML = '<p id="msg">No streams are active.</p>';
+        setTimeout(poll, 2000);
+        return;
+      }
+      div.innerHTML = '';
+      streams.forEach(function(s) {
+        var a = document.createElement('a');
+        a.href = s.path;
+        a.className = 'stream-btn';
+        a.textContent = s.name;
+        div.appendChild(a);
+      });
+    })
+    .catch(function() {
+      document.getElementById('msg').textContent = 'Could not connect.';
+      setTimeout(poll, 3000);
+    });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>OBS Web Preview</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+
+  #v {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }
+
+  /* 90°/270°: swap CSS dimensions so the landscape video fills a portrait screen */
+  #v.r90 {
+    top: 50%; left: 50%;
+    width: 100vh; height: 100vw;
+    transform: translate(-50%, -50%) rotate(90deg);
+  }
+  #v.r180 { transform: rotate(180deg); }
+  #v.r270 {
+    top: 50%; left: 50%;
+    width: 100vh; height: 100vw;
+    transform: translate(-50%, -50%) rotate(270deg);
+  }
+
+  #status {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0,0,0,.7);
+    color: #fff;
+    padding: 8px 18px;
+    border-radius: 20px;
+    font: 14px/1.4 sans-serif;
+    pointer-events: none;
+    text-align: center;
+    transition: opacity .5s;
+    max-width: 80vw;
+    z-index: 20;
+  }
+  #status.hidden { opacity: 0; }
+
+  .ctrl {
+    position: fixed;
+    width: 104px; height: 104px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0,0,0,.55);
+    color: #fff;
+    font-size: 48px;
+    line-height: 104px;
+    text-align: center;
+    cursor: pointer;
+    z-index: 30;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  .ctrl:active { background: rgba(255,255,255,.25); }
+  #rotbtn  { bottom: 20px; right: 20px; }
+  #fsbtn   { bottom: 20px; right: 140px; }
+  #backbtn { bottom: 20px; left: 20px; font-size: 36px; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<div id="status">Connecting…</div>
+<button id="backbtn" class="ctrl" title="Back">⬅</button>
+<button id="fsbtn"   class="ctrl" title="Fullscreen">⛶</button>
+<button id="rotbtn"  class="ctrl" title="Rotate">⟳</button>
+
+<script>
+(async function() {
+  const video  = document.getElementById('v');
+  const status = document.getElementById('status');
+  const rotbtn = document.getElementById('rotbtn');
+  const fsbtn  = document.getElementById('fsbtn');
+  const backbtn= document.getElementById('backbtn');
+
+  // ── Back button ────────────────────────────────────────────────────────────
+  backbtn.addEventListener('click', () => { location.href = '/'; });
+
+  // ── Rotation ──────────────────────────────────────────────────────────────
+  const rotClasses = ['', 'r90', 'r180', 'r270'];
+  let rotIdx = 0;
+
+  rotbtn.addEventListener('click', () => {
+    if (rotClasses[rotIdx]) video.classList.remove(rotClasses[rotIdx]);
+    rotIdx = (rotIdx + 1) % 4;
+    if (rotClasses[rotIdx]) video.classList.add(rotClasses[rotIdx]);
+  });
+
+  // ── Fullscreen ────────────────────────────────────────────────────────────
+  fsbtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+      fsbtn.textContent = '✕';
+    } else {
+      document.exitFullscreen();
+      fsbtn.textContent = '⛶';
+    }
+  });
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement)
+      fsbtn.textContent = '⛶';
+  });
+
+  // ── Status helpers ─────────────────────────────────────────────────────────
+  function setStatus(msg, autohide) {
+    status.textContent = msg;
+    status.classList.remove('hidden');
+    if (autohide) setTimeout(() => status.classList.add('hidden'), 3000);
+  }
+
+  // ── WebRTC connect loop ────────────────────────────────────────────────────
+  const offerPath = location.pathname.startsWith('/2') ? '/offer2' : '/offer';
+
+  async function connect() {
+    setStatus('Connecting…');
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    pc.ontrack = ({ streams }) => {
+      if (streams?.[0]) {
+        video.srcObject = streams[0];
+        setStatus('Live', true);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s !== 'connected')
+        setStatus('ICE: ' + (pc.iceConnectionState || '?') + ' / PC: ' + s);
+      if (s === 'failed' || s === 'disconnected') {
+        pc.close();
+        setTimeout(connect, 2000);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.connectionState !== 'connected')
+        setStatus('ICE: ' + pc.iceConnectionState + ' / PC: ' + pc.connectionState);
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      if (pc.iceGatheringState !== 'complete') {
+        await Promise.race([
+          new Promise(res => {
+            pc.addEventListener('icegatheringstatechange', function h() {
+              if (pc.iceGatheringState === 'complete') {
+                pc.removeEventListener('icegatheringstatechange', h);
+                res();
+              }
+            });
+          }),
+          new Promise(res => setTimeout(res, 3000))
+        ]);
+      }
+
+      const r = await fetch(offerPath, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+
+      await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+      setStatus('Waiting for video…');
+    } catch (e) {
+      setStatus('Error. Retrying…');
+      pc.close();
+      setTimeout(connect, 3000);
+    }
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>

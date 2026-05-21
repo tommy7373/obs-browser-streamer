@@ -1,0 +1,12 @@
+{
+  "name": "obs-web-preview",
+  "version": "1.0.0",
+  "author": "Thomas",
+  "website": "",
+  "uuid": "obs-web-preview",
+  "dependencies": {
+    "obs-studio": {
+      "version": ">=31.0.0"
+    }
+  }
+}
