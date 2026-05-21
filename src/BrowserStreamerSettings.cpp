@@ -10,6 +10,10 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <cstring>
+#include <map>
+#include <vector>
+
 BrowserStreamerSettings::BrowserStreamerSettings(WebPreviewPlugin* plugin, QWidget* parent)
     : QDialog(parent)
     , plugin_(plugin)
@@ -79,8 +83,13 @@ void BrowserStreamerSettings::AddStreamRow(int idx)
     PopulateSources(row.sourceCombo, currentSource);
     grpLayout->addRow(obs_module_text("WebPreview.Source"), row.sourceCombo);
 
+    row.encoderCombo = new QComboBox(row.group);
+    QString currentEncoder = QString::fromStdString(plugin_->GetConfig(idx).encoderId);
+    PopulateEncoders(row.encoderCombo, currentEncoder);
+    grpLayout->addRow(obs_module_text("WebPreview.Encoder"), row.encoderCombo);
+
     row.bitrateSpin = new QSpinBox(row.group);
-    row.bitrateSpin->setRange(500, 20000);
+    row.bitrateSpin->setRange(500, 50000);
     row.bitrateSpin->setSuffix(" kbps");
     row.bitrateSpin->setValue(plugin_->GetConfig(idx).bitrateKbps);
     grpLayout->addRow(obs_module_text("WebPreview.Bitrate"), row.bitrateSpin);
@@ -118,8 +127,9 @@ void BrowserStreamerSettings::OnAccepted()
 
     for (int i = 0; i < static_cast<int>(rows_.size()); ++i) {
         StreamConfig cfg = plugin_->GetConfig(i); // preserve name
-        cfg.sourceName   = rows_[i].sourceCombo->currentData().toString().toStdString();
-        cfg.bitrateKbps  = rows_[i].bitrateSpin->value();
+        cfg.sourceName  = rows_[i].sourceCombo->currentData().toString().toStdString();
+        cfg.encoderId   = rows_[i].encoderCombo->currentData().toString().toStdString();
+        cfg.bitrateKbps = rows_[i].bitrateSpin->value();
         plugin_->SetConfig(i, cfg);
     }
 
@@ -160,3 +170,51 @@ void BrowserStreamerSettings::PopulateSources(QComboBox* combo, const QString& c
             combo->setCurrentIndex(idx);
     }
 }
+
+void BrowserStreamerSettings::PopulateEncoders(QComboBox* combo, const QString& currentEncoder)
+{
+    combo->clear();
+
+    // Collect H.264 video encoders that are NOT texture-only (texture encoders
+    // pull GPU textures directly from OBS's main pipeline and can't be wired
+    // to a custom video_output_t; using them silently produces no output and
+    // corrupts OBS's encoder thread).
+    struct Entry { QString id; QString label; };
+    std::vector<Entry> entries;
+
+    const char* id = nullptr;
+    for (size_t i = 0; obs_enum_encoder_types(i, &id); i++) {
+        if (!id || obs_get_encoder_type(id) != OBS_ENCODER_VIDEO)
+            continue;
+        const char* codec = obs_get_encoder_codec(id);
+        if (!codec || (strcmp(codec, "h264") != 0 && strcmp(codec, "H264") != 0))
+            continue;
+        uint32_t caps = obs_get_encoder_caps(id);
+        if (caps & OBS_ENCODER_CAP_PASS_TEXTURE)
+            continue;  // skip texture-only encoders
+        if (caps & OBS_ENCODER_CAP_DEPRECATED)
+            continue;
+        const char* display = obs_encoder_get_display_name(id);
+        entries.push_back({QString::fromUtf8(id),
+                           QString::fromUtf8(display ? display : id)});
+    }
+
+    // De-duplicate display labels by appending the encoder id when collisions
+    // exist (some OBS builds expose multiple encoders with the same name).
+    std::map<QString, int> labelCount;
+    for (const auto& e : entries) labelCount[e.label]++;
+
+    for (const auto& e : entries) {
+        QString text = (labelCount[e.label] > 1)
+            ? QString("%1 (%2)").arg(e.label).arg(e.id)
+            : e.label;
+        combo->addItem(text, e.id);
+    }
+
+    if (combo->count() == 0)
+        combo->addItem("x264 (Software)", "obs_x264");
+
+    int idx = combo->findData(currentEncoder.isEmpty() ? QString("obs_x264") : currentEncoder);
+    if (idx >= 0) combo->setCurrentIndex(idx);
+}
+

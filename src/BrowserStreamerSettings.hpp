@@ -21,11 +21,13 @@ private:
     void AddStreamRow(int idx);
     void RemoveLastStreamRow();
     void PopulateSources(QComboBox* combo, const QString& currentSource);
+    void PopulateEncoders(QComboBox* combo, const QString& currentEncoder);
 
     struct StreamRow {
-        QGroupBox* group      = nullptr;
-        QComboBox* sourceCombo= nullptr;
-        QSpinBox*  bitrateSpin= nullptr;
+        QGroupBox* group        = nullptr;
+        QComboBox* sourceCombo  = nullptr;
+        QComboBox* encoderCombo = nullptr;
+        QSpinBox*  bitrateSpin  = nullptr;
     };
 
     WebPreviewPlugin* plugin_;

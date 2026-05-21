@@ -83,20 +83,16 @@
   const fsbtn  = document.getElementById('fsbtn');
   const backbtn= document.getElementById('backbtn');
 
-  // ── Back button ────────────────────────────────────────────────────────────
   backbtn.addEventListener('click', () => { location.href = '/'; });
 
-  // ── Rotation ──────────────────────────────────────────────────────────────
   const rotClasses = ['', 'r90', 'r180', 'r270'];
   let rotIdx = 0;
-
   rotbtn.addEventListener('click', () => {
     if (rotClasses[rotIdx]) video.classList.remove(rotClasses[rotIdx]);
     rotIdx = (rotIdx + 1) % 4;
     if (rotClasses[rotIdx]) video.classList.add(rotClasses[rotIdx]);
   });
 
-  // ── Fullscreen ────────────────────────────────────────────────────────────
   fsbtn.addEventListener('click', () => {
     if (!document.fullscreenElement) {
       document.documentElement.requestFullscreen();
@@ -111,14 +107,12 @@
       fsbtn.textContent = '⛶';
   });
 
-  // ── Status helpers ─────────────────────────────────────────────────────────
   function setStatus(msg, autohide) {
     status.textContent = msg;
     status.classList.remove('hidden');
     if (autohide) setTimeout(() => status.classList.add('hidden'), 3000);
   }
 
-  // ── WebRTC connect loop ────────────────────────────────────────────────────
   const streamIdx = (parseInt(location.pathname.slice(1)) || 1) - 1;
   const offerPath = '/offer/' + streamIdx;
 
@@ -129,28 +123,53 @@
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
 
+    let alive = true;
+    function cleanup(delayMs) {
+      if (!alive) return;
+      alive = false;
+      pc.close();
+      setTimeout(connect, delayMs);
+    }
+
     pc.addTransceiver('video', { direction: 'recvonly' });
 
-    pc.ontrack = ({ streams }) => {
-      if (streams?.[0]) {
-        video.srcObject = streams[0];
-        setStatus('Live', true);
-      }
+    pc.ontrack = (e) => {
+      // Chrome fires ontrack with an empty streams array when the answer SDP
+      // has no a=msid; Firefox creates a default stream.  Handle both.
+      const stream = (e.streams && e.streams.length > 0)
+        ? e.streams[0]
+        : new MediaStream([e.track]);
+      video.srcObject = stream;
+      video.play().catch(() => {});
+      setStatus('Live', true);
+
+      // Small 100ms jitter buffer — Chrome is fine at 0 but Firefox stutters
+      // without a buffer to absorb decode timing variance.  NACK (handled by
+      // the plugin's RtcpNackResponder) recovers from actual packet loss.
+      try {
+        if (e.receiver) e.receiver.playoutDelayHint = 0.1;
+        else pc.getReceivers().forEach(r => {
+          if (r.track && r.track.kind === 'video') r.playoutDelayHint = 0.1;
+        });
+      } catch(_) {}
     };
 
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
-      if (s !== 'connected')
-        setStatus('ICE: ' + (pc.iceConnectionState || '?') + ' / PC: ' + s);
-      if (s === 'failed' || s === 'disconnected') {
-        pc.close();
-        setTimeout(connect, 2000);
+      if (s === 'connected') {
+        setStatus('Live', true);
+      } else if (s === 'disconnected') {
+        setStatus('Reconnecting…');
+        // Give the connection a moment to self-heal (common on flaky WiFi)
+        // before tearing down and starting a fresh ICE attempt.
+        setTimeout(() => {
+          if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed')
+            cleanup(1000);
+        }, 2000);
+      } else if (s === 'failed') {
+        setStatus('Connection lost. Reconnecting…');
+        cleanup(1000);
       }
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      if (pc.connectionState !== 'connected')
-        setStatus('ICE: ' + pc.iceConnectionState + ' / PC: ' + pc.connectionState);
     };
 
     try {
@@ -179,12 +198,14 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
 
-      await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+      // Status set BEFORE setRemoteDescription so ontrack (which fires during
+      // setRemoteDescription in some browsers) can override it with 'Live'.
       setStatus('Waiting for video…');
-    } catch (e) {
+
+      await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+    } catch (err) {
       setStatus('Error. Retrying…');
-      pc.close();
-      setTimeout(connect, 3000);
+      cleanup(2000);
     }
   }
 

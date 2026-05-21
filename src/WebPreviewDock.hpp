@@ -11,6 +11,7 @@ class WebPreviewPlugin;
 struct StreamWidgets {
     QLabel*      statusDot    = nullptr;
     QLabel*      nameLabel    = nullptr;
+    QLabel*      sourceLabel  = nullptr;
     QPushButton* startStopBtn = nullptr;
 };
 

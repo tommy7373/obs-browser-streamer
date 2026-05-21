@@ -74,9 +74,15 @@ void WebPreviewDock::RebuildStreamRows()
         rows_[i].statusDot->setStyleSheet(kDotStopped);
         rowLayout->addWidget(rows_[i].statusDot);
 
-        // Name label (flex)
+        // Stream number (compact, fixed)
         rows_[i].nameLabel = new QLabel(rowWidget);
-        rowLayout->addWidget(rows_[i].nameLabel, 1);
+        rows_[i].nameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        rowLayout->addWidget(rows_[i].nameLabel);
+
+        // Source name (flex)
+        rows_[i].sourceLabel = new QLabel(rowWidget);
+        rows_[i].sourceLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        rowLayout->addWidget(rows_[i].sourceLabel, 1);
 
         // Start/Stop button
         rows_[i].startStopBtn = new QPushButton(rowWidget);
@@ -97,8 +103,12 @@ void WebPreviewDock::UpdateStreamRow(int idx)
 
     bool streaming = plugin_->IsStreaming(idx);
 
+    const auto& cfg = plugin_->GetConfig(idx);
     rows_[idx].statusDot->setStyleSheet(streaming ? kDotStreaming : kDotStopped);
-    rows_[idx].nameLabel->setText(QString::fromStdString(plugin_->GetConfig(idx).name));
+    rows_[idx].nameLabel->setText(QString::number(idx + 1));
+    rows_[idx].sourceLabel->setText(cfg.sourceName.empty()
+        ? QString("(no source)")
+        : QString::fromStdString(cfg.sourceName));
     rows_[idx].startStopBtn->setText(obs_module_text(
         streaming ? "WebPreview.Stop" : "WebPreview.Start"));
 }

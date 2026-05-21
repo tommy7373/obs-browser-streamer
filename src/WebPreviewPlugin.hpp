@@ -20,6 +20,17 @@ struct PeerInfo {
     std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig;
     std::atomic<bool> ready{false};
     std::atomic<bool> dead{false};
+    // Set on connect and on PLI receipt; non-IDR packets are withheld until
+    // the next keyframe so a desynchronised peer resumes cleanly.
+    std::atomic<bool> needsKeyframe{true};
+};
+
+// Shared between StreamState and per-peer onOpen lambdas so new viewers get
+// an immediate IDR instead of waiting up to keyint_sec.
+struct KeyframeCache {
+    std::mutex           mutex;
+    std::vector<uint8_t> data;         // Annex-B IDR with SPS/PPS prepended
+    uint32_t             rtpTimestamp = 0;
 };
 
 struct StreamState {
@@ -27,11 +38,13 @@ struct StreamState {
     std::mutex                             peersMutex;
     std::vector<std::shared_ptr<PeerInfo>> activePeers;
     std::atomic<bool>                      streaming{false};
+    std::shared_ptr<KeyframeCache>         keyframeCache = std::make_shared<KeyframeCache>();
 };
 
 struct StreamConfig {
     std::string name;            // display name, default "Stream N"
     std::string sourceName;      // OBS source/scene name
+    std::string encoderId = "obs_x264";  // video encoder id (e.g. obs_x264, ffmpeg_nvenc, ffmpeg_amf, obs_qsv11_h264)
     int         bitrateKbps = 2500;
 };
 

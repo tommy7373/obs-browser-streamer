@@ -1,6 +1,10 @@
 #include "WebPreviewPlugin.hpp"
 #include "WebPreviewOutput.hpp"
 
+#include <rtc/plihandler.hpp>
+#include <rtc/rtcpnackresponder.hpp>
+#include <rtc/rtcpsrreporter.hpp>
+
 // Suppress httplib deprecation warnings on MSVC
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -81,7 +85,8 @@ bool WebPreviewPlugin::Start(int idx)
     if (s.streaming)
         return false;
 
-    bool started = s.output->Start(configs_[idx].sourceName, configs_[idx].bitrateKbps,
+    bool started = s.output->Start(configs_[idx].sourceName, configs_[idx].encoderId,
+        configs_[idx].bitrateKbps,
         [this, idx](encoder_packet* pkt) { FeedVideoPacket(idx, pkt); });
     if (!started)
         return false;
@@ -234,8 +239,12 @@ void WebPreviewPlugin::LoadSettings()
             configs_[i].sourceName = source;
 
         int bitrate = static_cast<int>(obs_data_get_int(data, (prefix + "bitrate").c_str()));
-        if (bitrate >= 500 && bitrate <= 20000)
+        if (bitrate >= 500 && bitrate <= 50000)
             configs_[i].bitrateKbps = bitrate;
+
+        const char* enc = obs_data_get_string(data, (prefix + "encoder").c_str());
+        if (enc && enc[0])
+            configs_[i].encoderId = enc;
     }
 
     obs_data_release(data);
@@ -259,8 +268,9 @@ void WebPreviewPlugin::SaveSettings()
 
     for (int i = 0; i < kMaxStreams; ++i) {
         std::string prefix = "stream_" + std::to_string(i) + "_";
-        obs_data_set_string(data, (prefix + "name").c_str(),   configs_[i].name.c_str());
-        obs_data_set_string(data, (prefix + "source").c_str(), configs_[i].sourceName.c_str());
+        obs_data_set_string(data, (prefix + "name").c_str(),    configs_[i].name.c_str());
+        obs_data_set_string(data, (prefix + "source").c_str(),  configs_[i].sourceName.c_str());
+        obs_data_set_string(data, (prefix + "encoder").c_str(), configs_[i].encoderId.c_str());
         obs_data_set_int   (data, (prefix + "bitrate").c_str(), configs_[i].bitrateKbps);
     }
 
@@ -471,45 +481,148 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         return;
     }
 
-    // Find the H264 payload type from the browser's offer — the PT we use in
-    // rtpConfig must match what the browser negotiated.
-    int h264Pt = 96; // fallback
+    // Parse the offer for the video m-section's mid plus all H264 PTs and
+    // their packetization-mode.  Chrome (Unified Plan) is strict: the answer
+    // m-section's mid MUST match the offer's mid, and the negotiated H264 PT
+    // MUST have a consistent packetization-mode between offer and answer.
+    struct H264Offer { int pt = -1; int mode = 0; std::string profileLevelId; };
+    std::vector<H264Offer> h264Offers;
+    std::string videoMid = "video";
     {
         std::istringstream iss(offerSdp);
         std::string line;
+        bool inVideo = false;
+        bool gotVideoMid = false;
         while (std::getline(iss, line)) {
-            if (line.rfind("a=rtpmap:", 0) == 0 &&
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("m=", 0) == 0) {
+                inVideo = (line.rfind("m=video", 0) == 0);
+                continue;
+            }
+            if (inVideo && !gotVideoMid && line.rfind("a=mid:", 0) == 0) {
+                videoMid = line.substr(6);
+                gotVideoMid = true;
+            }
+            if (inVideo && line.rfind("a=rtpmap:", 0) == 0 &&
                 (line.find("H264/") != std::string::npos ||
                  line.find("h264/") != std::string::npos)) {
                 int pt = 0;
                 if (sscanf(line.c_str(), "a=rtpmap:%d", &pt) == 1)
-                    h264Pt = pt;
-                break;
+                    h264Offers.push_back({pt, 0, ""});
+            } else if (inVideo && line.rfind("a=fmtp:", 0) == 0) {
+                int pt = 0;
+                if (sscanf(line.c_str(), "a=fmtp:%d", &pt) == 1) {
+                    for (auto& e : h264Offers) {
+                        if (e.pt != pt) continue;
+                        if (line.find("packetization-mode=1") != std::string::npos)
+                            e.mode = 1;
+                        auto pos = line.find("profile-level-id=");
+                        if (pos != std::string::npos && pos + 17 + 6 <= line.size())
+                            e.profileLevelId = line.substr(pos + 17, 6);
+                    }
+                }
             }
         }
     }
-    blog(LOG_INFO, "[obs-web-preview] using H264 PT=%d", h264Pt);
 
-    // Add H264 SendOnly track using the browser's negotiated PT
-    rtc::Description::Video videoDesc("video", rtc::Description::Direction::SendOnly);
-    videoDesc.addH264Codec(h264Pt);
-    peer->track = peer->pc->addTrack(videoDesc);
+    // Prefer the first mode=1 entry; fall back to the first H264 entry.
+    int h264Pt = 96;
+    std::string profileLevelId;
+    for (auto& e : h264Offers) {
+        if (e.mode == 1) { h264Pt = e.pt; profileLevelId = e.profileLevelId; break; }
+    }
+    if (h264Pt == 96 && !h264Offers.empty()) {
+        h264Pt = h264Offers.front().pt;
+        profileLevelId = h264Offers.front().profileLevelId;
+    }
+    // Fall back to Constrained Baseline 3.1 (Firefox-compatible — see libdatachannel
+    // DEFAULT_H264_VIDEO_PROFILE comment) if the offer didn't specify a profile.
+    if (profileLevelId.empty()) profileLevelId = "42c01f";
+
+    blog(LOG_INFO, "[obs-web-preview] selected video mid='%s' H264 PT=%d profile=%s (from %zu H264 entries)",
+         videoMid.c_str(), h264Pt, profileLevelId.c_str(), h264Offers.size());
 
     const uint32_t ssrc = 42;
+
+    // Mirror the offer's mid in our answer so Chrome can BUNDLE the m-section.
+    // Add SSRC + msid so Chrome creates the inbound-rtp stream entry — without
+    // these, Chrome's Unified Plan refuses to set up the receive path.
+    rtc::Description::Video videoDesc(videoMid, rtc::Description::Direction::SendOnly);
+    // Mirror the browser's offered profile-level-id exactly.  Firefox's H264
+    // decoder is strict about this: if the answer advertises a profile (e.g.
+    // 42e01f with constraint_set2=1) that doesn't match the actual SPS bits
+    // produced by x264 baseline (constraint_set2=0), Firefox can stutter or
+    // drop frames even though the bitstream is valid.  Chrome is more lenient.
+    std::string h264Profile = "profile-level-id=" + profileLevelId
+                            + ";packetization-mode=1;level-asymmetry-allowed=1";
+    videoDesc.addH264Codec(h264Pt, h264Profile);
+
+    // Advertise RTCP feedback we support — the browser will only send NACK/PLI/FIR
+    // if these are declared in our answer SDP.  NACK retransmission is the single
+    // biggest reliability win for lossy mobile networks: instead of waiting for
+    // the next keyframe (causing a multi-frame freeze), the browser asks for the
+    // specific missing RTP packets and we resend them from a buffer.
+    if (auto* rtpMap = videoDesc.rtpMap(h264Pt)) {
+        rtpMap->addFeedback("nack");
+        rtpMap->addFeedback("nack pli");
+        rtpMap->addFeedback("ccm fir");
+        rtpMap->addFeedback("goog-remb");
+    }
+
+    videoDesc.addSSRC(ssrc, "obs-web-preview", "obs-stream", "obs-video-track");
+    peer->track = peer->pc->addTrack(videoDesc);
+
     peer->rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
         ssrc, "obs-web-preview", h264Pt, rtc::H264RtpPacketizer::defaultClockRate);
+
     auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
         rtc::NalUnit::Separator::StartSequence, peer->rtpConfig);
+
+    // Sender Reports: required for proper RTCP timing and for the browser to
+    // generate Receiver Reports + NACKs against our stream.
+    auto srReporter = std::make_shared<rtc::RtcpSrReporter>(peer->rtpConfig);
+    packetizer->addToChain(srReporter);
+
+    // NACK responder: buffers the last 1024 RTP packets so we can retransmit
+    // on demand when the browser sends an RTCP NACK for a lost packet.
+    auto nackResponder = std::make_shared<rtc::RtcpNackResponder>(1024);
+    packetizer->addToChain(nackResponder);
+
+    // PLI/FIR handler: when NACK can't recover (too much loss or packets aged
+    // out of the buffer), the browser sends a Picture Loss Indication and we
+    // wait for the next keyframe before sending P-frames again.
+    auto pliHandler = std::make_shared<rtc::PliHandler>(
+        [wp = std::weak_ptr<PeerInfo>(peer)]() {
+            if (auto p = wp.lock()) {
+                blog(LOG_INFO, "[obs-web-preview] PLI received — waiting for next keyframe");
+                p->needsKeyframe.store(true);
+            }
+        });
+    packetizer->addToChain(pliHandler);
     peer->track->setMediaHandler(packetizer);
 
-    peer->track->onOpen([wp = std::weak_ptr<PeerInfo>(peer)]() {
-        blog(LOG_INFO, "[obs-web-preview] track opened — peer is ready");
-        if (auto p = wp.lock())
-            p->ready = true;
-    });
+    // On track open: mark ready and immediately deliver the cached keyframe so
+    // new viewers don't wait up to keyint_sec for the first IDR.
+    auto cachePtr = stream.keyframeCache;
+    peer->track->onOpen([cachePtr, wp = std::weak_ptr<PeerInfo>(peer)]() {
+        auto p = wp.lock();
+        if (!p) return;
+        p->ready = true;
 
-    peer->track->onClosed([]() {
-        blog(LOG_INFO, "[obs-web-preview] track closed");
+        std::vector<uint8_t> kf;
+        uint32_t ts = 0;
+        {
+            std::lock_guard<std::mutex> lock(cachePtr->mutex);
+            kf = cachePtr->data;
+            ts = cachePtr->rtpTimestamp;
+        }
+        if (!kf.empty()) {
+            try {
+                p->rtpConfig->timestamp = ts;
+                p->track->send(reinterpret_cast<const std::byte*>(kf.data()), kf.size());
+                p->needsKeyframe.store(false);
+            } catch (...) {}
+        }
     });
 
     peer->pc->setLocalDescription(); // creates answer + starts ICE gathering
@@ -523,17 +636,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
     }
 
     std::string answerSdp = answerFuture.get();
-
-    {
-        std::istringstream iss(answerSdp);
-        std::string line;
-        while (std::getline(iss, line)) {
-            if (line.rfind("a=candidate",   0) == 0 ||
-                line.rfind("a=fingerprint", 0) == 0 ||
-                line.rfind("a=setup",       0) == 0)
-                blog(LOG_INFO, "[obs-web-preview] answer: %s", line.c_str());
-        }
-    }
 
     {
         std::lock_guard<std::mutex> lock(stream.peersMutex);
@@ -561,16 +663,32 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
                       * pkt->timebase_num / pkt->timebase_den;
     uint32_t rtpTs = static_cast<uint32_t>(ptsSeconds * 90000.0);
 
+    // Cache keyframes so new peers receive them immediately on connect.
+    if (pkt->keyframe) {
+        std::lock_guard<std::mutex> kfLock(stream.keyframeCache->mutex);
+        stream.keyframeCache->data.assign(pkt->data, pkt->data + pkt->size);
+        stream.keyframeCache->rtpTimestamp = rtpTs;
+    }
+
     std::lock_guard<std::mutex> lock(stream.peersMutex);
     CleanDeadPeers(stream);
 
+    if (stream.activePeers.empty())
+        return;
+
     for (auto& peer : stream.activePeers) {
         if (!peer->ready)
+            continue;
+        // After a PLI or on first connect, withhold non-keyframes — a peer that
+        // has lost sync can't decode them and they just waste bandwidth.
+        if (!pkt->keyframe && peer->needsKeyframe.load())
             continue;
         try {
             peer->rtpConfig->timestamp = rtpTs;
             auto* bytes = reinterpret_cast<const std::byte*>(pkt->data);
             peer->track->send(bytes, pkt->size);
+            if (pkt->keyframe)
+                peer->needsKeyframe.store(false);
         } catch (...) {
             peer->dead = true;
         }
