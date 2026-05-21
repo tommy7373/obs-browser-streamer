@@ -1,0 +1,114 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  OBS_DEPS_VERSION: '2025-07-11'
+  OBS_VERSION: '31.1.1'
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache OBS prebuilt deps
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: .deps/prebuilt
+          key: obs-deps-${{ env.OBS_DEPS_VERSION }}-x64-v1
+
+      - name: Download OBS prebuilt deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $base = "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}"
+          New-Item -ItemType Directory -Path .deps/prebuilt -Force | Out-Null
+          Invoke-WebRequest "$base/windows-deps-${{ env.OBS_DEPS_VERSION }}-x64.zip" -OutFile .deps/deps.zip
+          Invoke-WebRequest "$base/windows-deps-qt6-${{ env.OBS_DEPS_VERSION }}-x64.zip" -OutFile .deps/qt6.zip
+          Expand-Archive .deps/deps.zip -DestinationPath .deps/prebuilt/obs-deps-${{ env.OBS_DEPS_VERSION }}-x64
+          Expand-Archive .deps/qt6.zip -DestinationPath .deps/prebuilt/obs-deps-qt6-${{ env.OBS_DEPS_VERSION }}-x64
+          Remove-Item .deps/deps.zip, .deps/qt6.zip
+
+      - name: Cache libobs build
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: .deps/obs-install
+          key: libobs-${{ env.OBS_VERSION }}-deps-${{ env.OBS_DEPS_VERSION }}-x64-v2
+
+      - name: Build and install libobs
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $prefix = "$pwd/.deps/prebuilt/obs-deps-${{ env.OBS_DEPS_VERSION }}-x64;$pwd/.deps/prebuilt/obs-deps-qt6-${{ env.OBS_DEPS_VERSION }}-x64"
+          $install = "$pwd/.deps/obs-install"
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} --recursive https://github.com/obsproject/obs-studio.git .deps/obs-src
+          cmake -S .deps/obs-src -B .deps/obs-build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$prefix" `
+            -DCMAKE_INSTALL_PREFIX="$install" `
+            -DENABLE_PLUGINS=OFF `
+            -DENABLE_SCRIPTING=OFF `
+            -DENABLE_BROWSER=OFF `
+            -DENABLE_VIRTUALCAM=OFF `
+            -DENABLE_AJA=OFF `
+            -DENABLE_WEBSOCKET=OFF
+          cmake --build .deps/obs-build --config RelWithDebInfo --target libobs obs-frontend-api
+          cmake --install .deps/obs-build --config RelWithDebInfo --component Development
+          cmake --install .deps/obs-build --config RelWithDebInfo --component obs_libraries
+
+      - name: Configure plugin
+        shell: pwsh
+        run: |
+          $prefix = "$pwd/.deps/obs-install;$pwd/.deps/prebuilt/obs-deps-${{ env.OBS_DEPS_VERSION }}-x64;$pwd/.deps/prebuilt/obs-deps-qt6-${{ env.OBS_DEPS_VERSION }}-x64"
+          cmake -S . -B build_x64 -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$prefix" `
+            -DOBS_PLUGIN_BASE="$pwd/stage/obs-web-preview"
+
+      - name: Build plugin
+        run: cmake --build build_x64 --config RelWithDebInfo --parallel
+
+      - name: Install plugin
+        run: cmake --install build_x64 --config RelWithDebInfo
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/v")) {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+          } else {
+            $shortSha = "${{ github.sha }}".Substring(0, 9)
+            $version = "dev-$shortSha"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact=obs-web-preview-$version-windows-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path stage/obs-web-preview/* -DestinationPath "${{ steps.version.outputs.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-web-preview-${{ steps.version.outputs.version }}-windows-x64
+          path: ${{ steps.version.outputs.artifact }}
+          if-no-files-found: error
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.version.outputs.artifact }}
+          draft: true
+          generate_release_notes: true
