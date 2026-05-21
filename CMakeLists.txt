@@ -18,6 +18,7 @@ add_library(obs-web-preview MODULE
     src/WebPreviewPlugin.cpp
     src/WebPreviewOutput.cpp
     src/WebPreviewDock.cpp
+    src/BrowserStreamerSettings.cpp
 )
 
 target_link_libraries(obs-web-preview PRIVATE

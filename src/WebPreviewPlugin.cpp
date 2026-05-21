@@ -35,17 +35,20 @@
 
 WebPreviewPlugin::WebPreviewPlugin()
 {
-    streams_[0].output = std::make_unique<WebPreviewOutput>();
-    streams_[1].output = std::make_unique<WebPreviewOutput>();
-    streamNames_[0] = "Stream 1";
-    streamNames_[1] = "Stream 2";
+    for (int i = 0; i < kMaxStreams; ++i)
+        streams_[i].output = std::make_unique<WebPreviewOutput>();
+
+    for (int i = 0; i < kMaxStreams; ++i)
+        configs_[i].name = "Stream " + std::to_string(i + 1);
+
     LoadHtml();
     localIps_ = GetLocalIps();
+    LoadSettings();
 }
 
 WebPreviewPlugin::~WebPreviewPlugin()
 {
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < numStreams_; ++i)
         if (streams_[i].streaming)
             Stop(i);
 }
@@ -66,29 +69,33 @@ void WebPreviewPlugin::LoadHtml()
     viewerContent_  = loadFile("web/viewer.html");
 }
 
-bool WebPreviewPlugin::Start(int streamIdx, const std::string& sourceName, int port, int bitrateKbps)
+// -------------------------------------------------------------------------
+// Public API
+// -------------------------------------------------------------------------
+
+bool WebPreviewPlugin::Start(int idx)
 {
-    if (streamIdx < 0 || streamIdx > 1)
+    if (idx < 0 || idx >= numStreams_)
         return false;
-    auto& s = streams_[streamIdx];
+    auto& s = streams_[idx];
     if (s.streaming)
         return false;
 
-    bool started = s.output->Start(sourceName, bitrateKbps,
-        [this, streamIdx](encoder_packet* pkt) { FeedVideoPacket(streamIdx, pkt); });
+    bool started = s.output->Start(configs_[idx].sourceName, configs_[idx].bitrateKbps,
+        [this, idx](encoder_packet* pkt) { FeedVideoPacket(idx, pkt); });
     if (!started)
         return false;
 
-    EnsureServerRunning(port);
+    EnsureServerRunning();
     s.streaming = true;
     return true;
 }
 
-void WebPreviewPlugin::Stop(int streamIdx)
+void WebPreviewPlugin::Stop(int idx)
 {
-    if (streamIdx < 0 || streamIdx > 1)
+    if (idx < 0 || idx >= numStreams_)
         return;
-    auto& s = streams_[streamIdx];
+    auto& s = streams_[idx];
     if (!s.streaming)
         return;
 
@@ -105,28 +112,180 @@ void WebPreviewPlugin::Stop(int streamIdx)
     TryStopServer();
 }
 
-bool WebPreviewPlugin::IsStreaming(int streamIdx) const
+bool WebPreviewPlugin::IsStreaming(int idx) const
 {
-    if (streamIdx < 0 || streamIdx > 1)
+    if (idx < 0 || idx >= numStreams_)
         return false;
-    return streams_[streamIdx].streaming.load();
+    return streams_[idx].streaming.load();
 }
 
-bool WebPreviewPlugin::AnyStreaming() const
+int WebPreviewPlugin::GetViewerCount(int idx)
 {
-    return streams_[0].streaming.load() || streams_[1].streaming.load();
+    if (idx < 0 || idx >= numStreams_)
+        return 0;
+    auto& s = streams_[idx];
+    std::lock_guard<std::mutex> lock(s.peersMutex);
+    CleanDeadPeers(s);
+    int n = 0;
+    for (auto& p : s.activePeers)
+        if (p->ready) ++n;
+    return n;
+}
+
+int WebPreviewPlugin::GetNumStreams() const
+{
+    return numStreams_;
+}
+
+void WebPreviewPlugin::SetNumStreams(int n)
+{
+    if (n < 1) n = 1;
+    if (n > kMaxStreams) n = kMaxStreams;
+
+    // Stop any streams that are now out of range
+    for (int i = n; i < numStreams_; ++i)
+        if (streams_[i].streaming)
+            Stop(i);
+
+    // Initialize names for newly added streams if empty
+    for (int i = numStreams_; i < n; ++i)
+        if (configs_[i].name.empty())
+            configs_[i].name = "Stream " + std::to_string(i + 1);
+
+    numStreams_ = n;
+}
+
+int WebPreviewPlugin::GetPort() const
+{
+    return port_;
+}
+
+void WebPreviewPlugin::SetPort(int p)
+{
+    port_ = p;
+}
+
+const StreamConfig& WebPreviewPlugin::GetConfig(int idx) const
+{
+    static StreamConfig dummy;
+    if (idx < 0 || idx >= kMaxStreams)
+        return dummy;
+    return configs_[idx];
+}
+
+void WebPreviewPlugin::SetConfig(int idx, const StreamConfig& cfg)
+{
+    if (idx < 0 || idx >= kMaxStreams)
+        return;
+    configs_[idx] = cfg;
+}
+
+std::vector<std::string> WebPreviewPlugin::GetLandingUrls() const
+{
+    std::vector<std::string> urls;
+    for (const auto& ip : localIps_)
+        urls.push_back("http://" + ip + ":" + std::to_string(port_) + "/");
+    return urls;
+}
+
+void WebPreviewPlugin::FeedVideoPacket(int idx, encoder_packet* pkt)
+{
+    if (idx < 0 || idx >= numStreams_)
+        return;
+    auto& s = streams_[idx];
+    if (!s.streaming)
+        return;
+    FeedPacketToPool(pkt, s);
+}
+
+// -------------------------------------------------------------------------
+// Settings
+// -------------------------------------------------------------------------
+
+void WebPreviewPlugin::LoadSettings()
+{
+    char* path = obs_module_get_config_path(obs_current_module(), "settings.json");
+    if (!path)
+        return;
+    obs_data_t* data = obs_data_create_from_json_file(path);
+    bfree(path);
+    if (!data)
+        return;
+
+    int port = static_cast<int>(obs_data_get_int(data, "port"));
+    if (port >= 1024 && port <= 65535)
+        port_ = port;
+
+    int numStreams = static_cast<int>(obs_data_get_int(data, "num_streams"));
+    if (numStreams >= 1 && numStreams <= kMaxStreams)
+        numStreams_ = numStreams;
+
+    for (int i = 0; i < kMaxStreams; ++i) {
+        std::string prefix = "stream_" + std::to_string(i) + "_";
+
+        const char* name = obs_data_get_string(data, (prefix + "name").c_str());
+        if (name && name[0])
+            configs_[i].name = name;
+        else if (configs_[i].name.empty())
+            configs_[i].name = "Stream " + std::to_string(i + 1);
+
+        const char* source = obs_data_get_string(data, (prefix + "source").c_str());
+        if (source)
+            configs_[i].sourceName = source;
+
+        int bitrate = static_cast<int>(obs_data_get_int(data, (prefix + "bitrate").c_str()));
+        if (bitrate >= 500 && bitrate <= 20000)
+            configs_[i].bitrateKbps = bitrate;
+    }
+
+    obs_data_release(data);
+}
+
+void WebPreviewPlugin::SaveSettings()
+{
+    char* dir = obs_module_get_config_path(obs_current_module(), "");
+    if (dir) {
+        os_mkdirs(dir);
+        bfree(dir);
+    }
+
+    char* path = obs_module_get_config_path(obs_current_module(), "settings.json");
+    if (!path)
+        return;
+
+    obs_data_t* data = obs_data_create();
+    obs_data_set_int(data, "port", port_);
+    obs_data_set_int(data, "num_streams", numStreams_);
+
+    for (int i = 0; i < kMaxStreams; ++i) {
+        std::string prefix = "stream_" + std::to_string(i) + "_";
+        obs_data_set_string(data, (prefix + "name").c_str(),   configs_[i].name.c_str());
+        obs_data_set_string(data, (prefix + "source").c_str(), configs_[i].sourceName.c_str());
+        obs_data_set_int   (data, (prefix + "bitrate").c_str(), configs_[i].bitrateKbps);
+    }
+
+    obs_data_save_json_safe(data, path, "tmp", "bak");
+    obs_data_release(data);
+    bfree(path);
 }
 
 // -------------------------------------------------------------------------
 // HTTP server lifecycle
 // -------------------------------------------------------------------------
 
-void WebPreviewPlugin::EnsureServerRunning(int port)
+bool WebPreviewPlugin::AnyStreaming() const
+{
+    for (int i = 0; i < numStreams_; ++i)
+        if (streams_[i].streaming.load())
+            return true;
+    return false;
+}
+
+void WebPreviewPlugin::EnsureServerRunning()
 {
     if (server_)
         return; // already running
 
-    port_   = port;
     server_ = std::make_unique<httplib::Server>();
     RegisterRoutes();
 
@@ -149,7 +308,7 @@ void WebPreviewPlugin::TryStopServer()
 
 void WebPreviewPlugin::RegisterRoutes()
 {
-    // Landing page — lists active streams as clickable links
+    // Landing page
     server_->Get("/", [this](const httplib::Request&, httplib::Response& res) {
         if (landingContent_.empty()) {
             res.set_content(
@@ -160,31 +319,17 @@ void WebPreviewPlugin::RegisterRoutes()
         }
     });
 
-    // Per-stream viewer HTML (same file, JS uses path to pick offer endpoint)
-    auto serveViewer = [this](const httplib::Request&, httplib::Response& res) {
-        if (viewerContent_.empty()) {
-            res.set_content(
-                "<html><body><p>viewer.html not found in plugin data directory.</p></body></html>",
-                "text/html");
-        } else {
-            res.set_content(viewerContent_, "text/html");
-        }
-    };
-    server_->Get("/1", serveViewer);
-    server_->Get("/2", serveViewer);
-
     // Active streams list for the landing page JS
     server_->Get("/streams", [this](const httplib::Request&, httplib::Response& res) {
         std::string json = "[";
         bool first = true;
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < numStreams_; ++i) {
             if (!streams_[i].streaming)
                 continue;
             if (!first) json += ",";
             first = false;
-            // Escape the name for JSON
             std::string escaped;
-            for (char c : streamNames_[i]) {
+            for (char c : configs_[i].name) {
                 if (c == '"')       escaped += "\\\"";
                 else if (c == '\\') escaped += "\\\\";
                 else                escaped += c;
@@ -195,33 +340,38 @@ void WebPreviewPlugin::RegisterRoutes()
         res.set_content(json, "application/json");
     });
 
-    server_->Post("/offer", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!streams_[0].streaming) {
-            res.status = 503;
-            res.set_content("{\"error\":\"not streaming\"}", "application/json");
-            return;
-        }
-        HandleOfferRequest(req, res, streams_[0]);
-    });
+    // Per-stream routes registered dynamically
+    for (int i = 0; i < numStreams_; ++i) {
+        // Viewer HTML: /1, /2, /3, ...
+        std::string viewerPath = "/" + std::to_string(i + 1);
+        server_->Get(viewerPath, [this](const httplib::Request&, httplib::Response& res) {
+            if (viewerContent_.empty()) {
+                res.set_content(
+                    "<html><body><p>viewer.html not found in plugin data directory.</p></body></html>",
+                    "text/html");
+            } else {
+                res.set_content(viewerContent_, "text/html");
+            }
+        });
 
-    server_->Post("/offer2", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!streams_[1].streaming) {
-            res.status = 503;
-            res.set_content("{\"error\":\"not streaming\"}", "application/json");
-            return;
-        }
-        HandleOfferRequest(req, res, streams_[1]);
-    });
+        // Offer endpoint: /offer/0, /offer/1, ...
+        std::string offerPath = "/offer/" + std::to_string(i);
+        server_->Post(offerPath, [this, i](const httplib::Request& req, httplib::Response& res) {
+            if (!streams_[i].streaming) {
+                res.status = 503;
+                res.set_content("{\"error\":\"not streaming\"}", "application/json");
+                return;
+            }
+            HandleOfferRequest(req, res, streams_[i]);
+        });
 
-    server_->Get("/viewers", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content("{\"count\":" + std::to_string(GetViewerCount(0)) + "}",
-                        "application/json");
-    });
-
-    server_->Get("/viewers2", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content("{\"count\":" + std::to_string(GetViewerCount(1)) + "}",
-                        "application/json");
-    });
+        // Viewer count: /viewers/0, /viewers/1, ...
+        std::string viewersPath = "/viewers/" + std::to_string(i);
+        server_->Get(viewersPath, [this, i](const httplib::Request&, httplib::Response& res) {
+            res.set_content("{\"count\":" + std::to_string(GetViewerCount(i)) + "}",
+                            "application/json");
+        });
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -405,16 +555,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 // Video packet feeding — called from OBS encoder thread
 // -------------------------------------------------------------------------
 
-void WebPreviewPlugin::FeedVideoPacket(int streamIdx, encoder_packet* pkt)
-{
-    if (streamIdx < 0 || streamIdx > 1)
-        return;
-    auto& s = streams_[streamIdx];
-    if (!s.streaming)
-        return;
-    FeedPacketToPool(pkt, s);
-}
-
 void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream)
 {
     double ptsSeconds = static_cast<double>(pkt->pts)
@@ -437,32 +577,6 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
     }
 }
 
-// -------------------------------------------------------------------------
-// Helpers
-// -------------------------------------------------------------------------
-
-int WebPreviewPlugin::GetViewerCount(int streamIdx)
-{
-    if (streamIdx < 0 || streamIdx > 1)
-        return 0;
-    auto& s = streams_[streamIdx];
-    std::lock_guard<std::mutex> lock(s.peersMutex);
-    CleanDeadPeers(s);
-    int n = 0;
-    for (auto& p : s.activePeers)
-        if (p->ready) ++n;
-    return n;
-}
-
-std::vector<std::string> WebPreviewPlugin::GetStreamUrls(int streamIdx) const
-{
-    std::vector<std::string> urls;
-    const std::string suffix = (streamIdx == 0) ? "/" : "/2";
-    for (const auto& ip : localIps_)
-        urls.push_back("http://" + ip + ":" + std::to_string(port_) + suffix);
-    return urls;
-}
-
 void WebPreviewPlugin::CleanDeadPeers(StreamState& stream)
 {
     // Must be called with stream.peersMutex held
@@ -472,18 +586,9 @@ void WebPreviewPlugin::CleanDeadPeers(StreamState& stream)
         stream.activePeers.end());
 }
 
-void WebPreviewPlugin::SetStreamName(int streamIdx, const std::string& name)
-{
-    if (streamIdx >= 0 && streamIdx < 2)
-        streamNames_[streamIdx] = name;
-}
-
-std::string WebPreviewPlugin::GetStreamName(int streamIdx) const
-{
-    if (streamIdx >= 0 && streamIdx < 2)
-        return streamNames_[streamIdx];
-    return {};
-}
+// -------------------------------------------------------------------------
+// GetLocalIps
+// -------------------------------------------------------------------------
 
 std::vector<std::string> WebPreviewPlugin::GetLocalIps()
 {
