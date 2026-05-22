@@ -3,6 +3,7 @@
 
 #include "WebPreviewPlugin.hpp"
 #include "WebPreviewDock.hpp"
+#include "WebPreviewOutput.hpp"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-web-preview", "en-US")
@@ -25,6 +26,7 @@ static void FrontendEventCallback(enum obs_frontend_event event, void*)
 
 bool obs_module_load()
 {
+    WebPreviewOutput::RegisterOutputType();
     obs_frontend_add_event_callback(FrontendEventCallback, nullptr);
     return true;
 }

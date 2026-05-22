@@ -16,6 +16,10 @@ public:
     WebPreviewOutput();
     ~WebPreviewOutput();
 
+    // Registers the plugin's null obs_output_t type. Call once from
+    // obs_module_load before any WebPreviewOutput instance is created.
+    static void RegisterOutputType();
+
     // encoderId may be "obs_x264" or any fallback (non-texture) video encoder
     // such as "ffmpeg_nvenc", "ffmpeg_amf", "obs_qsv11_h264".  Texture
     // encoders (OBS_ENCODER_CAP_PASS_TEXTURE) cannot be used because they
@@ -48,7 +52,6 @@ private:
     uint32_t        renderWidth_  = 0;
     uint32_t        renderHeight_ = 0;
     std::string     videoOutputName_;
-    std::string     discardPath_;
 
     std::atomic<bool>    active_{false};
     PacketCallback       packetCb_;

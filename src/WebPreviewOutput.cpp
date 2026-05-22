@@ -10,6 +10,75 @@
 #include <cstring>
 
 // -------------------------------------------------------------------------
+// Null output type — hosts the encoder pipeline without writing anywhere.
+// Encoder packets reach us via obs_output_add_packet_callback. Replaces
+// ffmpeg_muxer, which required writing a real file and added disk I/O on
+// the encoder thread (potential source of backpressure-driven stutter).
+// -------------------------------------------------------------------------
+
+static const char* null_output_get_name(void*)
+{
+    return "obs-web-preview Null Output";
+}
+
+static void* null_output_create(obs_data_t*, obs_output_t* output)
+{
+    return output;
+}
+
+static void null_output_destroy(void*) {}
+
+static bool null_output_start(void* data)
+{
+    auto* output = static_cast<obs_output_t*>(data);
+    if (!obs_output_can_begin_data_capture(output, 0))
+        return false;
+    if (!obs_output_initialize_encoders(output, 0))
+        return false;
+    return obs_output_begin_data_capture(output, 0);
+}
+
+static void null_output_stop(void* data, uint64_t)
+{
+    auto* output = static_cast<obs_output_t*>(data);
+    obs_output_end_data_capture(output);
+}
+
+static void null_output_packet(void*, encoder_packet*) {}
+
+static struct obs_output_info null_output_info = {
+    /* id                    */ "obs_web_preview_null_output",
+    /* flags                 */ OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED,
+    /* get_name              */ null_output_get_name,
+    /* create                */ null_output_create,
+    /* destroy               */ null_output_destroy,
+    /* start                 */ null_output_start,
+    /* stop                  */ null_output_stop,
+    /* raw_video             */ nullptr,
+    /* raw_audio             */ nullptr,
+    /* encoded_packet        */ null_output_packet,
+    /* update                */ nullptr,
+    /* get_defaults          */ nullptr,
+    /* get_properties        */ nullptr,
+    /* unused1               */ nullptr,
+    /* get_total_bytes       */ nullptr,
+    /* get_dropped_frames    */ nullptr,
+    /* type_data             */ nullptr,
+    /* free_type_data        */ nullptr,
+    /* get_congestion        */ nullptr,
+    /* get_connect_time_ms   */ nullptr,
+    /* encoded_video_codecs  */ "h264",
+    /* encoded_audio_codecs  */ "aac",
+    /* raw_audio2            */ nullptr,
+    /* protocols             */ nullptr,
+};
+
+void WebPreviewOutput::RegisterOutputType()
+{
+    obs_register_output(&null_output_info);
+}
+
+// -------------------------------------------------------------------------
 // WebPreviewOutput
 // -------------------------------------------------------------------------
 
@@ -146,7 +215,7 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     }
     obs_encoder_set_video(vidEncoder_, videoOutput_);
 
-    // --- Audio encoder (ffmpeg_muxer needs an AV pair to start cleanly) ---
+    // --- Audio encoder (the output is declared OBS_OUTPUT_AV so we need a pair) ---
     obs_data_t* aenc = obs_data_create();
     obs_data_set_int(aenc, "bitrate", 128);
     audEncoder_ = obs_audio_encoder_create("ffmpeg_aac", "web_preview_aenc", aenc, 0, nullptr);
@@ -157,21 +226,10 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     }
     obs_encoder_set_audio(audEncoder_, obs_get_audio());
 
-    // --- ffmpeg_muxer — we intercept packets before they hit the muxer, but
-    // it still needs a writable file path to start (NUL fails on some Windows
-    // setups due to Controlled Folder Access or ffmpeg avio treating it as a
-    // regular file). Write a small discard file inside OBS's own config dir,
-    // which is always writable and already trusted by ransomware protection.
-    // MPEG-TS so no seek-back is required on close.
-    obs_data_t* mux = obs_data_create();
-    char cfgDir[512] = {0};
-    os_get_config_path(cfgDir, sizeof(cfgDir),
-                       "obs-studio/plugin_config/obs-web-preview");
-    os_mkdirs(cfgDir);
-    discardPath_ = std::string(cfgDir) + "/discard.ts";
-    obs_data_set_string(mux, "path", discardPath_.c_str());
-    obsOutput_ = obs_output_create("ffmpeg_muxer", "web_preview_output", mux, nullptr);
-    obs_data_release(mux);
+    // --- Null output — hosts the encoder pipeline, writes nothing. We pull
+    // packets via obs_output_add_packet_callback below.
+    obsOutput_ = obs_output_create("obs_web_preview_null_output",
+                                   "web_preview_output", nullptr, nullptr);
     if (!obsOutput_) {
         TeardownPipeline();
         return false;
@@ -408,11 +466,6 @@ void WebPreviewOutput::TeardownPipeline()
 {
     extraData_.clear();
     kfBuffer_.clear();
-
-    if (!discardPath_.empty()) {
-        os_unlink(discardPath_.c_str());
-        discardPath_.clear();
-    }
 
     if (obsOutput_) {
         obs_output_release(obsOutput_);
