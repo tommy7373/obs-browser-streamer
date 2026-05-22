@@ -36,6 +36,7 @@ private:
     obs_view_t*     view_       = nullptr;
     video_t*        viewVideo_  = nullptr;
     obs_encoder_t*  vidEncoder_ = nullptr;
+    obs_encoder_t*  audEncoder_ = nullptr;
     obs_output_t*   obsOutput_  = nullptr;
 
     uint32_t        renderWidth_  = 0;

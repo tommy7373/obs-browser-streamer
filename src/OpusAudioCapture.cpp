@@ -158,28 +158,27 @@ void OpusAudioCapture::OnAudio(struct audio_data* audio)
 {
     if (!running_ || !audio || !audio->data[0]) return;
 
-    // Planar float input → interleaved float into the ring buffer.
-    // OBS uses planar layout (one buffer per channel).
+    // We requested AUDIO_FORMAT_FLOAT (interleaved) from the converter, so
+    // audio->data[0] holds one contiguous LRLRLR... buffer of floats and
+    // data[1..] are unused. Copy whole interleaved frames straight into the
+    // ring buffer (which is also interleaved).
     const uint32_t frames = audio->frames;
     if (frames == 0) return;
+    const float* in = reinterpret_cast<const float*>(audio->data[0]);
 
     std::lock_guard<std::mutex> lock(ringMutex_);
-
     const size_t ringFrames = ring_.size() / channels_;
+
     for (uint32_t i = 0; i < frames; ++i) {
-        // Drop frames if the ring is full — better than blocking the OBS
-        // audio thread. The receiver hears a tiny gap, but the encoder
-        // stays synchronized.
         if (ringCount_ >= ringFrames) {
             blog(LOG_WARNING,
                  "[obs-web-preview] OpusAudioCapture: ring full, dropping samples");
             break;
         }
-        const size_t writeIdx = ringHead_ * channels_;
-        for (int c = 0; c < channels_; ++c) {
-            const float* plane = reinterpret_cast<const float*>(audio->data[c]);
-            ring_[writeIdx + c] = plane ? plane[i] : 0.0f;
-        }
+        const size_t writeBase = ringHead_ * channels_;
+        const size_t readBase  = static_cast<size_t>(i) * channels_;
+        for (int c = 0; c < channels_; ++c)
+            ring_[writeBase + c] = in[readBase + c];
         ringHead_ = (ringHead_ + 1) % ringFrames;
         ringCount_++;
     }
