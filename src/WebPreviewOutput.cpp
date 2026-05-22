@@ -212,8 +212,6 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     // WebRTC audio jitter buffers tuned for 20ms — heard as periodic stutter.
     obs_data_t* aenc = obs_data_create();
     obs_data_set_int(aenc, "bitrate", 128);
-    obs_data_set_int(aenc, "packet_loss", 10); // tells libopus to budget FEC for ~10% loss
-    obs_data_set_string(aenc, "ffmpeg_opts", "frame_duration=20");
     audEncoder_ = obs_audio_encoder_create("ffmpeg_opus", "web_preview_aenc", aenc, 0, nullptr);
     obs_data_release(aenc);
     if (!audEncoder_) {
