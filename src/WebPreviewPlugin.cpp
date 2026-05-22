@@ -1,6 +1,7 @@
 #include "WebPreviewPlugin.hpp"
 #include "WebPreviewOutput.hpp"
 #include "OpusAudioCapture.hpp"
+#include "Telestration.hpp"
 
 #include <rtc/plihandler.hpp>
 #include <rtc/rtcpnackresponder.hpp>
@@ -45,6 +46,10 @@ WebPreviewPlugin::WebPreviewPlugin()
         streams_[i].audioCapture = std::make_unique<OpusAudioCapture>();
     }
 
+    telestratorStream_.output       = std::make_unique<WebPreviewOutput>();
+    telestratorStream_.audioCapture = std::make_unique<OpusAudioCapture>();
+    telestratorConfig_.name         = "Telestrator";
+
     for (int i = 0; i < kMaxStreams; ++i)
         configs_[i].name = "Stream " + std::to_string(i + 1);
 
@@ -58,6 +63,8 @@ WebPreviewPlugin::~WebPreviewPlugin()
     for (int i = 0; i < numStreams_; ++i)
         if (streams_[i].streaming)
             Stop(i);
+    if (telestratorStream_.streaming)
+        StopTelestrator();
 }
 
 void WebPreviewPlugin::LoadHtml()
@@ -72,61 +79,27 @@ void WebPreviewPlugin::LoadHtml()
         ss << f.rdbuf();
         return ss.str();
     };
-    landingContent_ = loadFile("web/index.html");
-    viewerContent_  = loadFile("web/viewer.html");
+    landingContent_     = loadFile("web/index.html");
+    viewerContent_      = loadFile("web/viewer.html");
+    telestratorContent_ = loadFile("web/telestrator.html");
 }
 
 // -------------------------------------------------------------------------
-// Public API
+// Public API — regular streams
 // -------------------------------------------------------------------------
 
 bool WebPreviewPlugin::Start(int idx)
 {
     if (idx < 0 || idx >= numStreams_)
         return false;
-    auto& s = streams_[idx];
-    if (s.streaming)
-        return false;
-
-    bool started = s.output->Start(configs_[idx].sourceName, configs_[idx].encoderId,
-        configs_[idx].bitrateKbps,
-        [this, idx](encoder_packet* pkt) { FeedPacket(idx, pkt); });
-    if (!started)
-        return false;
-
-    // Start inline Opus capture: pulls raw PCM from OBS, encodes on its own
-    // worker thread at strict 20ms wallclock intervals, fires the callback
-    // with the encoded packet bytes + RTP timestamp.
-    s.audioCapture->Start(128 /* kbps */,
-        [this, idx](const uint8_t* data, size_t size, uint32_t rtpTs) {
-            SendAudioToPeers(idx, data, size, rtpTs);
-        });
-
-    EnsureServerRunning();
-    s.streaming = true;
-    return true;
+    return StartStream(streams_[idx], configs_[idx]);
 }
 
 void WebPreviewPlugin::Stop(int idx)
 {
     if (idx < 0 || idx >= numStreams_)
         return;
-    auto& s = streams_[idx];
-    if (!s.streaming)
-        return;
-
-    s.streaming = false;
-    s.output->Stop();
-    s.audioCapture->Stop();
-
-    {
-        std::lock_guard<std::mutex> lock(s.peersMutex);
-        for (auto& peer : s.activePeers)
-            peer->pc->close();
-        s.activePeers.clear();
-    }
-
-    TryStopServer();
+    StopStream(streams_[idx]);
 }
 
 bool WebPreviewPlugin::IsStreaming(int idx) const
@@ -159,12 +132,10 @@ void WebPreviewPlugin::SetNumStreams(int n)
     if (n < 1) n = 1;
     if (n > kMaxStreams) n = kMaxStreams;
 
-    // Stop any streams that are now out of range
     for (int i = n; i < numStreams_; ++i)
         if (streams_[i].streaming)
             Stop(i);
 
-    // Initialize names for newly added streams if empty
     for (int i = numStreams_; i < n; ++i)
         if (configs_[i].name.empty())
             configs_[i].name = "Stream " + std::to_string(i + 1);
@@ -172,15 +143,8 @@ void WebPreviewPlugin::SetNumStreams(int n)
     numStreams_ = n;
 }
 
-int WebPreviewPlugin::GetPort() const
-{
-    return port_;
-}
-
-void WebPreviewPlugin::SetPort(int p)
-{
-    port_ = p;
-}
+int WebPreviewPlugin::GetPort() const     { return port_; }
+void WebPreviewPlugin::SetPort(int p)     { port_ = p; }
 
 const StreamConfig& WebPreviewPlugin::GetConfig(int idx) const
 {
@@ -205,17 +169,94 @@ std::vector<std::string> WebPreviewPlugin::GetLandingUrls() const
     return urls;
 }
 
-void WebPreviewPlugin::FeedPacket(int idx, encoder_packet* pkt)
+std::vector<std::string> WebPreviewPlugin::GetTelestratorUrls() const
 {
-    if (idx < 0 || idx >= numStreams_ || !pkt)
-        return;
-    auto& s = streams_[idx];
+    std::vector<std::string> urls;
+    for (const auto& ip : localIps_)
+        urls.push_back("http://" + ip + ":" + std::to_string(port_) + "/telestrator");
+    return urls;
+}
+
+void WebPreviewPlugin::FeedPacket(int /*idx*/, encoder_packet* /*pkt*/)
+{
+    // Retained as a no-op for API compatibility; the per-stream lambdas in
+    // StartStream now feed packets directly to FeedVideoToPeers without
+    // round-tripping through this method.
+}
+
+// -------------------------------------------------------------------------
+// Telestrator slot
+// -------------------------------------------------------------------------
+
+bool WebPreviewPlugin::StartTelestrator()
+{
+    return StartStream(telestratorStream_, telestratorConfig_);
+}
+
+void WebPreviewPlugin::StopTelestrator()
+{
+    StopStream(telestratorStream_);
+    // Wipe any in-flight strokes — a fresh session starts empty.
+    telestratorStream_.telestration.Clear();
+}
+
+int WebPreviewPlugin::GetTelestratorViewerCount()
+{
+    auto& s = telestratorStream_;
+    std::lock_guard<std::mutex> lock(s.peersMutex);
+    CleanDeadPeers(s);
+    int n = 0;
+    for (auto& p : s.activePeers)
+        if (p->ready) ++n;
+    return n;
+}
+
+// -------------------------------------------------------------------------
+// Shared start/stop
+// -------------------------------------------------------------------------
+
+bool WebPreviewPlugin::StartStream(StreamState& s, const StreamConfig& cfg)
+{
+    if (s.streaming)
+        return false;
+
+    StreamState* sp = &s;
+    bool started = s.output->Start(cfg.sourceName, cfg.encoderId, cfg.bitrateKbps,
+        [this, sp](encoder_packet* pkt) {
+            if (!sp->streaming.load() || !pkt) return;
+            if (pkt->type == OBS_ENCODER_VIDEO)
+                FeedVideoToPeers(pkt, *sp);
+        });
+    if (!started)
+        return false;
+
+    s.audioCapture->Start(128 /* kbps */,
+        [this, sp](const uint8_t* data, size_t size, uint32_t rtpTs) {
+            SendAudioToStream(*sp, data, size, rtpTs);
+        });
+
+    EnsureServerRunning();
+    s.streaming = true;
+    return true;
+}
+
+void WebPreviewPlugin::StopStream(StreamState& s)
+{
     if (!s.streaming)
         return;
-    // Only video reaches us via this path now — audio is pumped directly
-    // by OpusAudioCapture which calls SendAudioToPeers from its worker.
-    if (pkt->type == OBS_ENCODER_VIDEO)
-        FeedVideoToPeers(pkt, s);
+
+    s.streaming = false;
+    s.output->Stop();
+    s.audioCapture->Stop();
+
+    {
+        std::lock_guard<std::mutex> lock(s.peersMutex);
+        for (auto& peer : s.activePeers)
+            peer->pc->close();
+        s.activePeers.clear();
+    }
+
+    TryStopServer();
 }
 
 // -------------------------------------------------------------------------
@@ -262,6 +303,15 @@ void WebPreviewPlugin::LoadSettings()
             configs_[i].encoderId = enc;
     }
 
+    telestratorEnabled_ = obs_data_get_bool(data, "telestrator_enabled");
+    const char* tsource = obs_data_get_string(data, "telestrator_source");
+    if (tsource) telestratorConfig_.sourceName = tsource;
+    const char* tenc = obs_data_get_string(data, "telestrator_encoder");
+    if (tenc && tenc[0]) telestratorConfig_.encoderId = tenc;
+    int tbitrate = static_cast<int>(obs_data_get_int(data, "telestrator_bitrate"));
+    if (tbitrate >= 500 && tbitrate <= 50000)
+        telestratorConfig_.bitrateKbps = tbitrate;
+
     obs_data_release(data);
 }
 
@@ -289,6 +339,11 @@ void WebPreviewPlugin::SaveSettings()
         obs_data_set_int   (data, (prefix + "bitrate").c_str(), configs_[i].bitrateKbps);
     }
 
+    obs_data_set_bool  (data, "telestrator_enabled", telestratorEnabled_);
+    obs_data_set_string(data, "telestrator_source",  telestratorConfig_.sourceName.c_str());
+    obs_data_set_string(data, "telestrator_encoder", telestratorConfig_.encoderId.c_str());
+    obs_data_set_int   (data, "telestrator_bitrate", telestratorConfig_.bitrateKbps);
+
     obs_data_save_json_safe(data, path, "tmp", "bak");
     obs_data_release(data);
     bfree(path);
@@ -303,6 +358,8 @@ bool WebPreviewPlugin::AnyStreaming() const
     for (int i = 0; i < numStreams_; ++i)
         if (streams_[i].streaming.load())
             return true;
+    if (telestratorStream_.streaming.load())
+        return true;
     return false;
 }
 
@@ -344,7 +401,8 @@ void WebPreviewPlugin::RegisterRoutes()
         }
     });
 
-    // Active streams list for the landing page JS
+    // Active streams list for the landing page JS — intentionally omits the
+    // telestrator slot so the controller URL stays unlisted.
     server_->Get("/streams", [this](const httplib::Request&, httplib::Response& res) {
         std::string json = "[";
         bool first = true;
@@ -367,7 +425,6 @@ void WebPreviewPlugin::RegisterRoutes()
 
     // Per-stream routes registered dynamically
     for (int i = 0; i < numStreams_; ++i) {
-        // Viewer HTML: /1, /2, /3, ...
         std::string viewerPath = "/" + std::to_string(i + 1);
         server_->Get(viewerPath, [this](const httplib::Request&, httplib::Response& res) {
             if (viewerContent_.empty()) {
@@ -379,7 +436,6 @@ void WebPreviewPlugin::RegisterRoutes()
             }
         });
 
-        // Offer endpoint: /offer/0, /offer/1, ...
         std::string offerPath = "/offer/" + std::to_string(i);
         server_->Post(offerPath, [this, i](const httplib::Request& req, httplib::Response& res) {
             if (!streams_[i].streaming) {
@@ -387,16 +443,48 @@ void WebPreviewPlugin::RegisterRoutes()
                 res.set_content("{\"error\":\"not streaming\"}", "application/json");
                 return;
             }
-            HandleOfferRequest(req, res, streams_[i]);
+            HandleOfferRequest(req, res, streams_[i], /*isTelestrator=*/false);
         });
 
-        // Viewer count: /viewers/0, /viewers/1, ...
         std::string viewersPath = "/viewers/" + std::to_string(i);
         server_->Get(viewersPath, [this, i](const httplib::Request&, httplib::Response& res) {
             res.set_content("{\"count\":" + std::to_string(GetViewerCount(i)) + "}",
                             "application/json");
         });
     }
+
+    // Telestrator routes — hidden from /streams but reachable directly.
+    server_->Get("/telestrator", [this](const httplib::Request&, httplib::Response& res) {
+        if (!telestratorStream_.streaming) {
+            res.status = 503;
+            res.set_content(
+                "<html><body><p>Telestrator is not enabled.</p></body></html>",
+                "text/html");
+            return;
+        }
+        if (telestratorContent_.empty()) {
+            res.set_content(
+                "<html><body><p>telestrator.html not found in plugin data directory.</p></body></html>",
+                "text/html");
+        } else {
+            res.set_content(telestratorContent_, "text/html");
+        }
+    });
+
+    server_->Post("/offer/telestrator", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!telestratorStream_.streaming) {
+            res.status = 503;
+            res.set_content("{\"error\":\"telestrator not enabled\"}", "application/json");
+            return;
+        }
+        HandleOfferRequest(req, res, telestratorStream_, /*isTelestrator=*/true);
+    });
+
+    server_->Get("/viewers/telestrator",
+        [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content("{\"count\":" + std::to_string(GetTelestratorViewerCount()) + "}",
+                            "application/json");
+        });
 }
 
 // -------------------------------------------------------------------------
@@ -404,7 +492,7 @@ void WebPreviewPlugin::RegisterRoutes()
 // -------------------------------------------------------------------------
 
 void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::Response& res,
-                                          StreamState& stream)
+                                          StreamState& stream, bool isTelestrator)
 {
     obs_data_t* jdata = obs_data_create_from_json(req.body.c_str());
     if (!jdata) { res.status = 400; return; }
@@ -424,7 +512,8 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         auto colon = host.rfind(':');
         bindIp = (colon != std::string::npos) ? host.substr(0, colon) : host;
     }
-    blog(LOG_INFO, "[obs-web-preview] /offer POST: bindIp=%s", bindIp.c_str());
+    blog(LOG_INFO, "[obs-web-preview] /offer POST: bindIp=%s%s",
+         bindIp.c_str(), isTelestrator ? " (telestrator)" : "");
 
     rtc::Configuration rtcConfig;
     if (!bindIp.empty() && bindIp != "localhost" && bindIp != "127.0.0.1")
@@ -472,9 +561,20 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         blog(LOG_INFO, "[obs-web-preview] ICE state → %s", name);
     });
 
-    // Register gathering callback BEFORE setRemoteDescription to avoid missing
-    // the Complete event (auto-negotiation is disabled so gathering fires after
-    // our explicit setLocalDescription call below).
+    // Telestrator-only: accept the browser-initiated "telestrate" DataChannel.
+    // Must be installed BEFORE setRemoteDescription so the DC m-line in the
+    // offer is acknowledged in our answer.
+    if (isTelestrator) {
+        peer->pc->onDataChannel([this, sp = &stream, wp = std::weak_ptr<PeerInfo>(peer)](
+                                    std::shared_ptr<rtc::DataChannel> dc) {
+            if (!dc) return;
+            if (dc->label() != "telestrate") return;
+            if (auto p = wp.lock())
+                p->telestrateDc = dc;
+            SetupTelestrateChannel(dc, *sp, wp);
+        });
+    }
+
     std::promise<std::string> answerPromise;
     std::atomic<bool> answerSet{false};
 
@@ -486,7 +586,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
             }
         });
 
-    // Accept browser's offer (won't auto-answer because disableAutoNegotiation=true)
     try {
         peer->pc->setRemoteDescription(rtc::Description(offerSdp, "offer"));
     } catch (const std::exception& e) {
@@ -496,11 +595,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         return;
     }
 
-    // Parse the offer for the video m-section's mid plus all H264 PTs and
-    // their packetization-mode, and the audio m-section's mid plus Opus PT.
-    // Chrome (Unified Plan) is strict: the answer m-section's mid MUST match
-    // the offer's mid, and the negotiated H264 PT MUST have a consistent
-    // packetization-mode between offer and answer.
     struct H264Offer { int pt = -1; int mode = 0; std::string profileLevelId; };
     std::vector<H264Offer> h264Offers;
     std::string videoMid = "video";
@@ -558,7 +652,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         }
     }
 
-    // Prefer the first mode=1 entry; fall back to the first H264 entry.
     int h264Pt = 96;
     std::string profileLevelId;
     for (auto& e : h264Offers) {
@@ -568,8 +661,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         h264Pt = h264Offers.front().pt;
         profileLevelId = h264Offers.front().profileLevelId;
     }
-    // Fall back to Constrained Baseline 3.1 (Firefox-compatible — see libdatachannel
-    // DEFAULT_H264_VIDEO_PROFILE comment) if the offer didn't specify a profile.
     if (profileLevelId.empty()) profileLevelId = "42c01f";
 
     blog(LOG_INFO, "[obs-web-preview] selected video mid='%s' H264 PT=%d profile=%s (from %zu H264 entries)",
@@ -577,24 +668,11 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 
     const uint32_t ssrc = 42;
 
-    // Mirror the offer's mid in our answer so Chrome can BUNDLE the m-section.
-    // Add SSRC + msid so Chrome creates the inbound-rtp stream entry — without
-    // these, Chrome's Unified Plan refuses to set up the receive path.
     rtc::Description::Video videoDesc(videoMid, rtc::Description::Direction::SendOnly);
-    // Mirror the browser's offered profile-level-id exactly.  Firefox's H264
-    // decoder is strict about this: if the answer advertises a profile (e.g.
-    // 42e01f with constraint_set2=1) that doesn't match the actual SPS bits
-    // produced by x264 baseline (constraint_set2=0), Firefox can stutter or
-    // drop frames even though the bitstream is valid.  Chrome is more lenient.
     std::string h264Profile = "profile-level-id=" + profileLevelId
                             + ";packetization-mode=1;level-asymmetry-allowed=1";
     videoDesc.addH264Codec(h264Pt, h264Profile);
 
-    // Advertise RTCP feedback we support — the browser will only send NACK/PLI/FIR
-    // if these are declared in our answer SDP.  NACK retransmission is the single
-    // biggest reliability win for lossy mobile networks: instead of waiting for
-    // the next keyframe (causing a multi-frame freeze), the browser asks for the
-    // specific missing RTP packets and we resend them from a buffer.
     if (auto* rtpMap = videoDesc.rtpMap(h264Pt)) {
         rtpMap->addFeedback("nack");
         rtpMap->addFeedback("nack pli");
@@ -611,19 +689,12 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
     auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
         rtc::NalUnit::Separator::StartSequence, peer->rtpConfig);
 
-    // Sender Reports: required for proper RTCP timing and for the browser to
-    // generate Receiver Reports + NACKs against our stream.
     auto srReporter = std::make_shared<rtc::RtcpSrReporter>(peer->rtpConfig);
     packetizer->addToChain(srReporter);
 
-    // NACK responder: buffers the last 1024 RTP packets so we can retransmit
-    // on demand when the browser sends an RTCP NACK for a lost packet.
     auto nackResponder = std::make_shared<rtc::RtcpNackResponder>(1024);
     packetizer->addToChain(nackResponder);
 
-    // PLI/FIR handler: when NACK can't recover (too much loss or packets aged
-    // out of the buffer), the browser sends a Picture Loss Indication and we
-    // wait for the next keyframe before sending P-frames again.
     auto pliHandler = std::make_shared<rtc::PliHandler>(
         [wp = std::weak_ptr<PeerInfo>(peer)]() {
             if (auto p = wp.lock()) {
@@ -634,8 +705,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
     packetizer->addToChain(pliHandler);
     peer->track->setMediaHandler(packetizer);
 
-    // On track open: mark ready and immediately deliver the cached keyframe so
-    // new viewers don't wait up to keyint_sec for the first IDR.
     auto cachePtr = stream.keyframeCache;
     peer->track->onOpen([cachePtr, wp = std::weak_ptr<PeerInfo>(peer)]() {
         auto p = wp.lock();
@@ -658,13 +727,10 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         }
     });
 
-    // --- Audio track (Opus) ---
     if (hasAudio && opusPt >= 0) {
         const uint32_t audioSsrc = 43;
         rtc::Description::Audio audioDesc(audioMid, rtc::Description::Direction::SendOnly);
         audioDesc.addOpusCodec(opusPt);
-        // No NACK advertised — retransmits arrive past playout deadline and
-        // become packetsDiscarded. FEC at the encoder handles small losses.
         audioDesc.addSSRC(audioSsrc, "obs-web-preview", "obs-stream", "obs-audio-track");
         peer->audioTrack = peer->pc->addTrack(audioDesc);
 
@@ -675,14 +741,6 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 
         auto audioSr = std::make_shared<rtc::RtcpSrReporter>(peer->audioRtpConfig);
         audioPacketizer->addToChain(audioSr);
-        // Deliberately no NACK or PacingHandler on audio:
-        //  - NACK retransmits packets that the receiver flagged as "lost",
-        //    but a retransmit arrives well after playout deadline, where
-        //    the browser counts it as packetsDiscarded → concealment.
-        //  - PacingHandler holds packets in a 10ms-tick queue, adding more
-        //    arrival delay on top of OBS's bursty encoder thread. With the
-        //    receiver-side 300ms jitter buffer already absorbing bursts,
-        //    pacing only buys late-arrival risk.
         peer->audioTrack->setMediaHandler(audioPacketizer);
 
         peer->audioTrack->onOpen([wp = std::weak_ptr<PeerInfo>(peer)]() {
@@ -695,7 +753,7 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
              hasAudio ? 1 : 0, opusPt);
     }
 
-    peer->pc->setLocalDescription(); // creates answer + starts ICE gathering
+    peer->pc->setLocalDescription();
 
     auto answerFuture = answerPromise.get_future();
     if (answerFuture.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
@@ -724,7 +782,73 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 }
 
 // -------------------------------------------------------------------------
-// Video packet feeding — called from OBS encoder thread
+// Telestrate DataChannel handling
+// -------------------------------------------------------------------------
+
+void WebPreviewPlugin::SetupTelestrateChannel(std::shared_ptr<rtc::DataChannel> dc,
+                                               StreamState& stream,
+                                               std::weak_ptr<PeerInfo> wp)
+{
+    StreamState* sp = &stream;
+    std::weak_ptr<rtc::DataChannel> wdc = dc;
+
+    dc->onOpen([this, sp, wdc]() {
+        auto d = wdc.lock();
+        if (!d) return;
+        try {
+            d->send(SerializeSnapshotMessage(sp->telestration.Snapshot()));
+        } catch (...) {}
+    });
+
+    dc->onMessage([this, sp, wp](rtc::message_variant msg) {
+        std::string s;
+        if (std::holds_alternative<std::string>(msg)) {
+            s = std::get<std::string>(msg);
+        } else {
+            const auto& bin = std::get<rtc::binary>(msg);
+            s.assign(reinterpret_cast<const char*>(bin.data()), bin.size());
+        }
+
+        TelestrateMessage m;
+        if (!ParseTelestrateMessage(s, m)) return;
+
+        bool changed = false;
+        switch (m.op) {
+            case TelestrateOp::Stroke_:
+                sp->telestration.Add(std::move(m.stroke));
+                changed = true;
+                break;
+            case TelestrateOp::Undo:
+                changed = sp->telestration.UndoById(m.undoId);
+                break;
+            case TelestrateOp::Clear:
+                sp->telestration.Clear();
+                changed = true;
+                break;
+            default:
+                break;
+        }
+        if (changed)
+            BroadcastTelestrate(*sp, s, wp);
+    });
+}
+
+void WebPreviewPlugin::BroadcastTelestrate(StreamState& stream, const std::string& json,
+                                            const std::weak_ptr<PeerInfo>& sender)
+{
+    auto senderPtr = sender.lock();
+    std::lock_guard<std::mutex> lock(stream.peersMutex);
+    for (auto& peer : stream.activePeers) {
+        if (!peer || peer->dead.load()) continue;
+        if (senderPtr && peer.get() == senderPtr.get()) continue;
+        auto dc = peer->telestrateDc;
+        if (!dc) continue;
+        try { dc->send(json); } catch (...) {}
+    }
+}
+
+// -------------------------------------------------------------------------
+// Video / audio packet feeding
 // -------------------------------------------------------------------------
 
 void WebPreviewPlugin::FeedVideoToPeers(encoder_packet* pkt, StreamState& stream)
@@ -746,8 +870,6 @@ void WebPreviewPlugin::FeedVideoToPeers(encoder_packet* pkt, StreamState& stream
     auto* bytes = reinterpret_cast<const std::byte*>(pkt->data);
     for (auto& peer : stream.activePeers) {
         if (!peer->ready) continue;
-        // After a PLI or on first connect, withhold non-keyframes — a peer
-        // that has lost sync can't decode them and they just waste bandwidth.
         if (!pkt->keyframe && peer->needsKeyframe.load()) continue;
         try {
             peer->rtpConfig->timestamp = rtpTs;
@@ -759,12 +881,9 @@ void WebPreviewPlugin::FeedVideoToPeers(encoder_packet* pkt, StreamState& stream
     }
 }
 
-void WebPreviewPlugin::SendAudioToPeers(int idx, const uint8_t* data,
-                                         size_t size, uint32_t rtpTs)
+void WebPreviewPlugin::SendAudioToStream(StreamState& stream, const uint8_t* data,
+                                          size_t size, uint32_t rtpTs)
 {
-    // Runs on the AudioPacer's worker thread at the paced wallclock time.
-    if (idx < 0 || idx >= numStreams_) return;
-    auto& stream = streams_[idx];
     if (!stream.streaming) return;
 
     std::lock_guard<std::mutex> lock(stream.peersMutex);
@@ -786,7 +905,6 @@ void WebPreviewPlugin::SendAudioToPeers(int idx, const uint8_t* data,
 
 void WebPreviewPlugin::CleanDeadPeers(StreamState& stream)
 {
-    // Must be called with stream.peersMutex held
     stream.activePeers.erase(
         std::remove_if(stream.activePeers.begin(), stream.activePeers.end(),
             [](const std::shared_ptr<PeerInfo>& p) { return p->dead.load(); }),

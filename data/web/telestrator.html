@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Telestrator++ — Controller</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; }
+
+  #v {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }
+
+  /* Canvas is sized and positioned by JS to match the video's letterboxed
+     content rect so drawing aligns pixel-perfect with what's on screen. */
+  #c {
+    position: fixed;
+    touch-action: none;
+    pointer-events: auto;
+    z-index: 10;
+  }
+
+  #status {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0,0,0,.7);
+    color: #fff;
+    padding: 8px 18px;
+    border-radius: 20px;
+    font: 14px/1.4 sans-serif;
+    pointer-events: none;
+    text-align: center;
+    transition: opacity .4s;
+    max-width: 80vw;
+    z-index: 50;
+  }
+  #status.hidden { opacity: 0; }
+
+  /* Toolbar at the bottom — fades after idle, restored on any input. */
+  #toolbar {
+    position: fixed;
+    left: 50%; bottom: 16px;
+    transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(0,0,0,.6);
+    padding: 8px 12px;
+    border-radius: 16px;
+    z-index: 40;
+    transition: opacity .35s ease-out;
+    backdrop-filter: blur(4px);
+  }
+  body.idle #toolbar { opacity: 0; pointer-events: none; }
+
+  .swatch {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    border: 2px solid #555;
+    cursor: pointer;
+  }
+  .swatch.sel { border-color: #fff; box-shadow: 0 0 0 2px #2a8aff; }
+
+  .tool {
+    width: 44px; height: 44px;
+    border-radius: 8px;
+    background: rgba(255,255,255,.08);
+    color: #fff;
+    border: 1px solid #444;
+    font-size: 20px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .tool.sel { background: #2a8aff; border-color: #fff; }
+  .tool:active { background: rgba(255,255,255,.2); }
+
+  #brushWrap {
+    display: flex; align-items: center; gap: 6px;
+    color: #fff; font: 12px sans-serif;
+  }
+  #brush {
+    -webkit-appearance: none;
+    width: 80px; height: 4px;
+    background: #555; border-radius: 2px; outline: none;
+  }
+  #brush::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px; height: 18px;
+    background: #fff; border-radius: 50%; cursor: pointer;
+  }
+
+  #colorPick {
+    width: 30px; height: 30px;
+    border: 2px solid #555;
+    border-radius: 50%;
+    background: none;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  #toolbar .sep {
+    width: 1px; height: 28px;
+    background: #444;
+    margin: 0 2px;
+  }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="status">Connecting…</div>
+
+<div id="toolbar">
+  <span class="swatch" data-color="#ffffff" style="background:#fff"></span>
+  <span class="swatch" data-color="#000000" style="background:#000"></span>
+  <span class="swatch" data-color="#ff3030" style="background:#ff3030"></span>
+  <span class="swatch" data-color="#30c030" style="background:#30c030"></span>
+  <span class="swatch" data-color="#3060ff" style="background:#3060ff"></span>
+  <span class="swatch" data-color="#ffd030" style="background:#ffd030"></span>
+  <input type="color" id="colorPick" title="Custom colour" value="#ff3030">
+  <span class="sep"></span>
+  <button class="tool sel" id="toolFree" title="Freehand">✎</button>
+  <button class="tool"     id="toolArrow" title="Arrow">➤</button>
+  <span class="sep"></span>
+  <span id="brushWrap"><span id="brushLbl">7</span><input type="range" id="brush" min="1" max="20" value="7"></span>
+  <span class="sep"></span>
+  <button class="tool" id="undoBtn"  title="Undo">↶</button>
+  <button class="tool" id="clearBtn" title="Clear">🗑</button>
+  <button class="tool" id="pinBtn"   title="Keep toolbar visible">📌</button>
+  <button class="tool" id="fsBtn"    title="Fullscreen">⛶</button>
+</div>
+
+<script>
+(async function () {
+  const video   = document.getElementById('v');
+  const canvas  = document.getElementById('c');
+  const ctx     = canvas.getContext('2d', { desynchronized: true, alpha: true });
+  const status  = document.getElementById('status');
+  const tb      = document.getElementById('toolbar');
+
+  // --- Toolbar state ---
+  let color   = '#ff3030';
+  let width   = 7;          // px @ canvas (which equals video.videoHeight when laid out)
+  let tool    = 'free';     // 'free' | 'arrow'
+  // Session-unique stroke-id prefix so two controllers' ids never collide.
+  // Keep the value below 2^31 so it fits in a signed 32-bit int after the
+  // server's JSON parse (Stroke.id is `int`). 14 bits of prefix * 100000
+  // counter slots = up to 16383 controllers, 100000 strokes each.
+  const idPrefix = Math.floor(Math.random() * 0x3fff) * 100000;
+  let strokeCounter = idPrefix + 1;
+
+  function selSwatch(el) {
+    document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('sel', s === el));
+  }
+  document.querySelectorAll('.swatch').forEach(s => {
+    s.addEventListener('click', () => {
+      color = s.getAttribute('data-color');
+      selSwatch(s);
+      document.getElementById('colorPick').value = color;
+    });
+  });
+  document.querySelector('.swatch[data-color="#ff3030"]').classList.add('sel');
+  document.getElementById('colorPick').addEventListener('input', e => {
+    color = e.target.value;
+    selSwatch(null);
+  });
+  document.getElementById('brush').addEventListener('input', e => {
+    width = parseInt(e.target.value, 10);
+    document.getElementById('brushLbl').textContent = width;
+  });
+  function selTool(name) {
+    tool = name;
+    document.getElementById('toolFree').classList.toggle('sel', name === 'free');
+    document.getElementById('toolArrow').classList.toggle('sel', name === 'arrow');
+  }
+  document.getElementById('toolFree' ).addEventListener('click', () => selTool('free'));
+  document.getElementById('toolArrow').addEventListener('click', () => selTool('arrow'));
+  document.getElementById('fsBtn').addEventListener('click', () => {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  });
+
+  // --- Idle fade + pin toggle ---
+  // Pinned = toolbar never fades. Persisted in localStorage so the choice
+  // survives reload.
+  let pinned = (function () {
+    try { return localStorage.getItem('telestrator.pin') === '1'; }
+    catch (_) { return false; }
+  })();
+  const pinBtn = document.getElementById('pinBtn');
+  function applyPinState() {
+    pinBtn.classList.toggle('sel', pinned);
+    if (pinned) {
+      document.body.classList.remove('idle');
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    } else {
+      bumpIdle();
+    }
+  }
+  pinBtn.addEventListener('click', () => {
+    pinned = !pinned;
+    try { localStorage.setItem('telestrator.pin', pinned ? '1' : '0'); } catch (_) {}
+    applyPinState();
+  });
+
+  let idleTimer = null;
+  function bumpIdle() {
+    document.body.classList.remove('idle');
+    if (idleTimer) clearTimeout(idleTimer);
+    if (pinned) return;
+    idleTimer = setTimeout(() => document.body.classList.add('idle'), 3500);
+  }
+  ['mousemove','mousedown','touchstart','keydown','pointerdown']
+    .forEach(ev => window.addEventListener(ev, bumpIdle, { passive: true }));
+  applyPinState();
+
+  function setStatus(msg, autohide) {
+    status.textContent = msg;
+    status.classList.remove('hidden');
+    if (autohide) setTimeout(() => status.classList.add('hidden'), 2000);
+  }
+
+  // --- Stroke store ---
+  // Strokes are stored in NORMALISED coordinates (0..1 of canvas WxH which
+  // matches the video's intrinsic size). To draw, multiply by the current
+  // canvas dimensions.
+  const strokes = [];     // committed strokes from anywhere (self + peers)
+  let   inflight = null;  // in-progress local stroke (not yet committed)
+
+  function widthPxToNorm(px) {
+    // Stroke.width on the wire is normalised to canvas HEIGHT, so OBS-side
+    // scaling is independent of source resolution.
+    return px / (canvas.height || 1080);
+  }
+  function widthNormToPx(nw) {
+    return nw * (canvas.height || 1080);
+  }
+
+  function drawStroke(s) {
+    if (!s.points || s.points.length === 0) return;
+    const w = canvas.width, h = canvas.height;
+    const lineW = Math.max(1, widthNormToPx(s.width));
+    ctx.lineWidth   = lineW;
+    ctx.strokeStyle = s.color;
+    ctx.fillStyle   = s.color;
+    ctx.lineCap     = 'round';
+    ctx.lineJoin    = 'round';
+
+    if (s.type === 'arrow' && s.points.length >= 2) {
+      const p0 = s.points[0], p1 = s.points[s.points.length - 1];
+      const x0 = p0.x * w, y0 = p0.y * h;
+      const x1 = p1.x * w, y1 = p1.y * h;
+      const dx = x1 - x0, dy = y1 - y0;
+      const len = Math.hypot(dx, dy);
+      if (len < 0.01) return;
+      const baseLen  = lineW * 3;
+      const baseHalf = lineW * 1.5;
+      const ux = dx / len, uy = dy / len;
+
+      // Shaft
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1 - ux * baseLen, y1 - uy * baseLen);
+      ctx.stroke();
+
+      // Head
+      const px = -uy, py = ux;
+      const bx = x1 - ux * baseLen, by = y1 - uy * baseLen;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(bx + px * baseHalf, by + py * baseHalf);
+      ctx.lineTo(bx - px * baseHalf, by - py * baseHalf);
+      ctx.closePath();
+      ctx.fill();
+      return;
+    }
+
+    if (s.points.length === 1) {
+      const p = s.points[0];
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, lineW * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(s.points[0].x * w, s.points[0].y * h);
+    for (let i = 1; i < s.points.length; i++)
+      ctx.lineTo(s.points[i].x * w, s.points[i].y * h);
+    ctx.stroke();
+  }
+
+  function redraw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const s of strokes) drawStroke(s);
+    if (inflight) drawStroke(inflight);
+  }
+
+  // --- Sizing: align canvas to the video's letterboxed content rect ---
+  function layoutCanvas() {
+    const vw = video.videoWidth  || 1920;
+    const vh = video.videoHeight || 1080;
+    const cw = window.innerWidth;
+    const ch = window.innerHeight;
+    const scale = Math.min(cw / vw, ch / vh);
+    const dispW = vw * scale, dispH = vh * scale;
+    const left = (cw - dispW) / 2, top = (ch - dispH) / 2;
+    canvas.style.left   = left + 'px';
+    canvas.style.top    = top  + 'px';
+    canvas.style.width  = dispW + 'px';
+    canvas.style.height = dispH + 'px';
+    // Internal coordinate system stays at intrinsic video resolution so
+    // PointerEvent coords convert directly (after subtracting the display
+    // offset) into the same 0..1 space the OBS source consumes.
+    canvas.width  = vw;
+    canvas.height = vh;
+    redraw();
+  }
+  window.addEventListener('resize', layoutCanvas);
+  video.addEventListener('loadedmetadata', layoutCanvas);
+
+  // --- Pointer drawing ---
+  function pointerToNorm(ev) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) / rect.width;
+    const y = (ev.clientY - rect.top ) / rect.height;
+    return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+  }
+
+  // DataChannel handle (set in connect()); send() is a no-op until open.
+  let sendFn = () => {};
+
+  // Throttle in-flight stroke broadcasts so live drawing stays smooth on
+  // the OBS side without saturating the DC with a message per pointer event.
+  const LIVE_EMIT_MS = 33;
+  let lastEmitMs = 0;
+  function emitInflight(force) {
+    if (!inflight) return;
+    const now = performance.now();
+    if (!force && now - lastEmitMs < LIVE_EMIT_MS) return;
+    lastEmitMs = now;
+    try { sendFn(JSON.stringify({ op: 'stroke', ...inflight })); } catch (_) {}
+  }
+
+  canvas.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== undefined && ev.button !== 0) return;
+    canvas.setPointerCapture(ev.pointerId);
+    const p = pointerToNorm(ev);
+    inflight = {
+      id: strokeCounter++,
+      type: tool === 'arrow' ? 'arrow' : 'freehand',
+      color: color,
+      width: widthPxToNorm(width),
+      points: [p],
+    };
+    lastEmitMs = 0;
+    redraw();
+    emitInflight(true);   // immediate first emit so OBS sees the start dot
+    ev.preventDefault();
+  });
+
+  canvas.addEventListener('pointermove', (ev) => {
+    if (!inflight) return;
+    const p = pointerToNorm(ev);
+    if (inflight.type === 'arrow') {
+      if (inflight.points.length < 2) inflight.points.push(p);
+      else inflight.points[1] = p;
+    } else {
+      const last = inflight.points[inflight.points.length - 1];
+      const dx = (p.x - last.x) * canvas.width;
+      const dy = (p.y - last.y) * canvas.height;
+      if (dx * dx + dy * dy > 1.5) inflight.points.push(p);
+    }
+    redraw();
+    emitInflight(false);
+    ev.preventDefault();
+  });
+
+  function finishStroke(ev) {
+    if (!inflight) return;
+    try { canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+    if (inflight.type === 'arrow' && inflight.points.length < 2) {
+      // Trivial arrow tap — withdraw it from the OBS side too.
+      const id = inflight.id;
+      inflight = null;
+      redraw();
+      try { sendFn(JSON.stringify({ op: 'undo', id: id })); } catch (_) {}
+      return;
+    }
+    const s = inflight;
+    inflight = null;
+    strokes.push(s);
+    redraw();
+    // Final commit — guaranteed delivery of the complete stroke regardless
+    // of throttling state.
+    try { sendFn(JSON.stringify({ op: 'stroke', ...s })); } catch (_) {}
+  }
+  canvas.addEventListener('pointerup',     finishStroke);
+  canvas.addEventListener('pointercancel', finishStroke);
+  canvas.addEventListener('pointerleave',  finishStroke);
+
+  // --- Toolbar actions ---
+  document.getElementById('undoBtn').addEventListener('click', () => {
+    const popped = strokes.pop();
+    if (!popped) return;
+    redraw();
+    try { sendFn(JSON.stringify({ op: 'undo', id: popped.id })); } catch (_) {}
+  });
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    strokes.length = 0;
+    inflight = null;
+    redraw();
+    try { sendFn(JSON.stringify({ op: 'clear' })); } catch (_) {}
+  });
+
+  // --- WebRTC + DataChannel ---
+  async function connect() {
+    setStatus('Connecting…');
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    let alive = true;
+    function cleanup(delayMs) {
+      if (!alive) return;
+      alive = false;
+      sendFn = () => {};
+      try { pc.close(); } catch (_) {}
+      setTimeout(connect, delayMs);
+    }
+
+    // Controller -> server stroke channel. Reliable + ordered so undo/clear
+    // arrive in sequence with strokes.
+    const dc = pc.createDataChannel('telestrate', { ordered: true });
+    dc.onopen = () => {
+      sendFn = (msg) => { try { dc.send(msg); } catch (_) {} };
+    };
+    dc.onclose = () => { sendFn = () => {}; };
+    dc.onmessage = (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m.op === 'snapshot') {
+        strokes.length = 0;
+        if (Array.isArray(m.strokes)) {
+          for (const s of m.strokes) strokes.push(s);
+        }
+        redraw();
+      } else if (m.op === 'stroke') {
+        // Upsert by id so other controllers' in-flight strokes update in
+        // place instead of stacking duplicates.
+        const i = strokes.findIndex(s => s.id === m.id);
+        if (i >= 0) strokes[i] = m;
+        else        strokes.push(m);
+        if (typeof m.id === 'number' && m.id >= strokeCounter)
+          strokeCounter = m.id + 1;
+        redraw();
+      } else if (m.op === 'undo') {
+        const i = strokes.findIndex(s => s.id === m.id);
+        if (i >= 0) { strokes.splice(i, 1); redraw(); }
+      } else if (m.op === 'clear') {
+        strokes.length = 0;
+        redraw();
+      }
+    };
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    const remoteStream = new MediaStream();
+    video.srcObject = remoteStream;
+    pc.ontrack = (e) => {
+      remoteStream.addTrack(e.track);
+      video.play().catch(() => {});
+      if (e.track.kind === 'video') setStatus('Live', true);
+      try {
+        pc.getReceivers().forEach(r => { if (r) r.playoutDelayHint = 0.1; });
+      } catch (_) {}
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === 'connected') {
+        setStatus('Live', true);
+      } else if (s === 'disconnected') {
+        setStatus('Reconnecting…');
+        setTimeout(() => {
+          if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed')
+            cleanup(1000);
+        }, 2000);
+      } else if (s === 'failed') {
+        setStatus('Connection lost. Reconnecting…');
+        cleanup(1000);
+      }
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      if (pc.iceGatheringState !== 'complete') {
+        await Promise.race([
+          new Promise(res => {
+            pc.addEventListener('icegatheringstatechange', function h() {
+              if (pc.iceGatheringState === 'complete') {
+                pc.removeEventListener('icegatheringstatechange', h);
+                res();
+              }
+            });
+          }),
+          new Promise(res => setTimeout(res, 3000))
+        ]);
+      }
+
+      const r = await fetch('/offer/telestrator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+
+      setStatus('Waiting for video…');
+      await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+    } catch (err) {
+      setStatus('Error. Retrying…');
+      cleanup(2000);
+    }
+  }
+
+  layoutCanvas();
+  connect();
+})();
+</script>
+</body>
+</html>

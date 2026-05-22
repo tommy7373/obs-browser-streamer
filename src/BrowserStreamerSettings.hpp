@@ -35,4 +35,6 @@ private:
     QSpinBox*         portSpin_     = nullptr;
     QVBoxLayout*      streamsLayout_= nullptr;
     std::vector<StreamRow> rows_;
+
+    StreamRow         telRow_       = {};
 };

@@ -1,9 +1,10 @@
-# Browser Streamer — OBS Plugin
+# Telestrator++ — OBS Plugin
 
-An OBS Studio plugin for Windows that streams any scene or source to browsers on your local network via WebRTC. No external software, no Node.js, no separate signaling server — everything runs inside OBS.
+An OBS Studio plugin for Windows that adds native sports-style telestration **and** streams any scene or source to browsers on your local network via WebRTC. No external software, no Node.js, no separate signaling server — everything runs inside OBS.
 
 ## Features
 
+- **Native telestrator overlay** — add the "Telestrator Overlay" source to a scene and draw on it from any browser (iPad with Apple Pencil, phone, laptop) over a hidden WebRTC controller URL. Freehand + arrow tool, colors, undo/clear, multi-controller sync.
 - Up to **8 independent streams** simultaneously, each with its own source, encoder, and bitrate
 - **Hardware encoder support** — software x264, NVENC (CPU + texture paths), AMF (CPU + texture paths), Intel QSV — any H.264 encoder OBS exposes
 - **Synchronized audio + video** — full OBS audio mix encoded as Opus and delivered alongside the video on the same WebRTC PeerConnection
@@ -38,7 +39,7 @@ An OBS Studio plugin for Windows that streams any scene or source to browsers on
 
 ## Usage
 
-1. In OBS open **View → Docks → Browser Streamer**
+1. In OBS open **View → Docks → Telestrator++**
 2. Click **Settings** to configure:
    - **Port** — HTTP server port (default 8080)
    - **Streams** — number of streams to expose (1–8)

@@ -2,6 +2,10 @@
 build*/
 out/
 
+# Reference clone of the upstream WebRTC-Telestrator project (kept locally for
+# feature parity work; not part of this codebase).
+temp-telestrator/
+
 # CMake user presets (contain local machine paths — configure manually)
 CMakeUserPresets.json
 

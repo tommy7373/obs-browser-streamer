@@ -9,6 +9,8 @@
 #include <vector>
 #include <obs.h>
 
+#include "Telestration.hpp"
+
 namespace httplib { class Server; class Request; class Response; }
 class WebPreviewOutput;
 class OpusAudioCapture;
@@ -21,6 +23,7 @@ struct PeerInfo {
     std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig;      // video
     std::shared_ptr<rtc::Track>                  audioTrack;
     std::shared_ptr<rtc::RtpPacketizationConfig> audioRtpConfig;
+    std::shared_ptr<rtc::DataChannel>            telestrateDc;   // only populated on /offer/telestrator peers
     std::atomic<bool> ready{false};                              // video track open
     std::atomic<bool> audioReady{false};
     std::atomic<bool> dead{false};
@@ -44,6 +47,10 @@ struct StreamState {
     std::vector<std::shared_ptr<PeerInfo>> activePeers;
     std::atomic<bool>                      streaming{false};
     std::shared_ptr<KeyframeCache>         keyframeCache = std::make_shared<KeyframeCache>();
+    // Only populated/consumed for the dedicated telestrator stream. Other
+    // streams ignore this field — keeping it here avoids forking the
+    // start/stop/peer-management machinery.
+    TelestrationState                      telestration;
 };
 
 struct StreamConfig {
@@ -71,7 +78,19 @@ public:
     const StreamConfig& GetConfig(int idx) const;
     void                SetConfig(int idx, const StreamConfig& cfg);
 
+    // --- Telestrator (dedicated hidden stream slot) ---
+    bool                IsTelestratorEnabled() const { return telestratorEnabled_; }
+    void                SetTelestratorEnabled(bool e) { telestratorEnabled_ = e; }
+    bool                IsTelestratorStreaming() const { return telestratorStream_.streaming.load(); }
+    bool                StartTelestrator();
+    void                StopTelestrator();
+    int                 GetTelestratorViewerCount();
+    const StreamConfig& GetTelestratorConfig() const { return telestratorConfig_; }
+    void                SetTelestratorConfig(const StreamConfig& c) { telestratorConfig_ = c; }
+    TelestrationState&  TelestrationStateRef() { return telestratorStream_.telestration; }
+
     std::vector<std::string> GetLandingUrls() const;
+    std::vector<std::string> GetTelestratorUrls() const;
 
     void LoadSettings();
     void SaveSettings();
@@ -83,10 +102,15 @@ private:
     int          numStreams_ = 2;
     int          port_       = 8080;
 
+    StreamState  telestratorStream_;
+    StreamConfig telestratorConfig_;
+    bool         telestratorEnabled_ = false;
+
     std::unique_ptr<httplib::Server> server_;
     std::thread                      serverThread_;
     std::string                      landingContent_;
     std::string                      viewerContent_;
+    std::string                      telestratorContent_;
     std::vector<std::string>         localIps_;
 
     bool AnyStreaming() const;
@@ -94,9 +118,23 @@ private:
     void EnsureServerRunning();
     void TryStopServer();
     void RegisterRoutes();
-    void HandleOfferRequest(const httplib::Request& req, httplib::Response& res, StreamState& stream);
+
+    // Shared start/stop worker — reused by regular slot indices and the
+    // telestrator slot. The callback closures bind to the StreamState by
+    // pointer so we don't need a sentinel index for telestrator.
+    bool StartStream(StreamState& s, const StreamConfig& cfg);
+    void StopStream(StreamState& s);
+
+    void HandleOfferRequest(const httplib::Request& req, httplib::Response& res,
+                            StreamState& stream, bool isTelestrator);
+    void SetupTelestrateChannel(std::shared_ptr<rtc::DataChannel> dc,
+                                StreamState& stream,
+                                std::weak_ptr<PeerInfo> wp);
+    void BroadcastTelestrate(StreamState& stream, const std::string& json,
+                             const std::weak_ptr<PeerInfo>& sender);
     void FeedVideoToPeers(encoder_packet* pkt, StreamState& stream);
-    void SendAudioToPeers(int idx, const uint8_t* data, size_t size, uint32_t rtpTs);
+    void SendAudioToStream(StreamState& stream, const uint8_t* data, size_t size,
+                           uint32_t rtpTs);
     void CleanDeadPeers(StreamState& stream);
     std::vector<std::string> GetLocalIps();
 };

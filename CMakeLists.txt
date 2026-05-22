@@ -26,6 +26,8 @@ add_library(obs-web-preview MODULE
     src/WebPreviewDock.cpp
     src/BrowserStreamerSettings.cpp
     src/OpusAudioCapture.cpp
+    src/Telestration.cpp
+    src/TelestratorSource.cpp
 )
 
 target_link_libraries(obs-web-preview PRIVATE

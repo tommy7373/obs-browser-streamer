@@ -53,6 +53,29 @@ BrowserStreamerSettings::BrowserStreamerSettings(WebPreviewPlugin* plugin, QWidg
     scrollArea->setWidget(scrollContent);
     mainLayout->addWidget(scrollArea, 1);
 
+    // ---- Telestrator config block ----
+    telRow_.group = new QGroupBox(obs_module_text("WebPreview.TelestratorGroup"), this);
+    auto* telLayout = new QFormLayout(telRow_.group);
+    telLayout->setSpacing(4);
+
+    telRow_.sourceCombo = new QComboBox(telRow_.group);
+    PopulateSources(telRow_.sourceCombo,
+                    QString::fromStdString(plugin_->GetTelestratorConfig().sourceName));
+    telLayout->addRow(obs_module_text("WebPreview.Source"), telRow_.sourceCombo);
+
+    telRow_.encoderCombo = new QComboBox(telRow_.group);
+    PopulateEncoders(telRow_.encoderCombo,
+                     QString::fromStdString(plugin_->GetTelestratorConfig().encoderId));
+    telLayout->addRow(obs_module_text("WebPreview.Encoder"), telRow_.encoderCombo);
+
+    telRow_.bitrateSpin = new QSpinBox(telRow_.group);
+    telRow_.bitrateSpin->setRange(500, 50000);
+    telRow_.bitrateSpin->setSuffix(" kbps");
+    telRow_.bitrateSpin->setValue(plugin_->GetTelestratorConfig().bitrateKbps);
+    telLayout->addRow(obs_module_text("WebPreview.Bitrate"), telRow_.bitrateSpin);
+
+    mainLayout->addWidget(telRow_.group);
+
     // Button box
     auto* buttonBox = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -131,6 +154,14 @@ void BrowserStreamerSettings::OnAccepted()
         cfg.encoderId   = rows_[i].encoderCombo->currentData().toString().toStdString();
         cfg.bitrateKbps = rows_[i].bitrateSpin->value();
         plugin_->SetConfig(i, cfg);
+    }
+
+    if (telRow_.group) {
+        StreamConfig tcfg = plugin_->GetTelestratorConfig();
+        tcfg.sourceName  = telRow_.sourceCombo->currentData().toString().toStdString();
+        tcfg.encoderId   = telRow_.encoderCombo->currentData().toString().toStdString();
+        tcfg.bitrateKbps = telRow_.bitrateSpin->value();
+        plugin_->SetTelestratorConfig(tcfg);
     }
 
     plugin_->SaveSettings();
