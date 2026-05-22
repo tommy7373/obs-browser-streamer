@@ -718,6 +718,22 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
                              * pkt->timebase_num / pkt->timebase_den;
     const uint32_t rtpTs     = static_cast<uint32_t>(ptsSeconds * clockRate);
 
+    // Diagnostic: warn when audio packets arrive with a >50ms gap from the
+    // previous one (Opus produces them every 20ms). Confirms whether the
+    // OBS-side audio encoder thread is the source of gaps the receiver hears.
+    if (isAudio) {
+        static thread_local uint64_t prevWallNs = 0;
+        const uint64_t nowNs = os_gettime_ns();
+        if (prevWallNs != 0) {
+            const uint64_t deltaMs = (nowNs - prevWallNs) / 1'000'000ull;
+            if (deltaMs > 50)
+                blog(LOG_WARNING,
+                     "[obs-web-preview] audio packet gap: %llu ms wallclock "
+                     "(expected ~20)", (unsigned long long)deltaMs);
+        }
+        prevWallNs = nowNs;
+    }
+
     // Cache video keyframes so new peers receive them immediately on connect.
     if (!isAudio && pkt->keyframe) {
         std::lock_guard<std::mutex> kfLock(stream.keyframeCache->mutex);
