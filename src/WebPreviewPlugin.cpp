@@ -726,20 +726,31 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
                              * pkt->timebase_num / pkt->timebase_den;
     const uint32_t rtpTs     = static_cast<uint32_t>(ptsSeconds * clockRate);
 
-    // Diagnostic: warn when audio packets arrive with a >50ms gap from the
-    // previous one (Opus produces them every 20ms). Confirms whether the
-    // OBS-side audio encoder thread is the source of gaps the receiver hears.
+    // Diagnostic: flag audio packets whose pts delta isn't the expected
+    // 960 samples (one 20ms Opus frame). A wrong delta means the encoder
+    // is jumping forward or back in its timeline, which the receiver fills
+    // with concealment. Logging is rate-limited so we get a signal, not spam.
     if (isAudio) {
-        static thread_local uint64_t prevWallNs = 0;
+        static thread_local int64_t prevPts = -1;
+        static thread_local int     warnRemaining = 0;
+        static thread_local uint64_t lastResetNs = 0;
         const uint64_t nowNs = os_gettime_ns();
-        if (prevWallNs != 0) {
-            const uint64_t deltaMs = (nowNs - prevWallNs) / 1'000'000ull;
-            if (deltaMs > 50)
-                blog(LOG_WARNING,
-                     "[obs-web-preview] audio packet gap: %llu ms wallclock "
-                     "(expected ~20)", (unsigned long long)deltaMs);
+        if (nowNs - lastResetNs > 5'000'000'000ull) { // every 5s
+            warnRemaining = 5;
+            lastResetNs   = nowNs;
         }
-        prevWallNs = nowNs;
+        if (prevPts >= 0) {
+            const int64_t dPts = (int64_t)pkt->pts - prevPts;
+            if (dPts != 960 && warnRemaining > 0) {
+                blog(LOG_WARNING,
+                     "[obs-web-preview] audio pts delta=%lld (expected 960) "
+                     "timebase=%d/%d size=%zu",
+                     (long long)dPts, pkt->timebase_num, pkt->timebase_den,
+                     pkt->size);
+                warnRemaining--;
+            }
+        }
+        prevPts = (int64_t)pkt->pts;
     }
 
     // Cache video keyframes so new peers receive them immediately on connect.

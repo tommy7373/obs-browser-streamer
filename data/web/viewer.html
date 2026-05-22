@@ -219,32 +219,41 @@
 
     if (inboundAudio) {
       const prevAud = prevReport ? prevReport.get(inboundAudio.id) : null;
-      const aBytes  = prevAud ? (inboundAudio.bytesReceived   - prevAud.bytesReceived)   : 0;
-      const aLost   = prevAud ? (inboundAudio.packetsLost     - prevAud.packetsLost)     : 0;
-      const aRecv   = prevAud ? (inboundAudio.packetsReceived - prevAud.packetsReceived) : 0;
-      const aNack   = prevAud ? ((inboundAudio.nackCount||0)  - (prevAud.nackCount||0))  : 0;
-      const aConceal= prevAud ? ((inboundAudio.concealedSamples||0) - (prevAud.concealedSamples||0)) : 0;
-      const aFec    = prevAud ? ((inboundAudio.fecPacketsReceived||0) - (prevAud.fecPacketsReceived||0)) : 0;
-      const aJb     = inboundAudio.jitterBufferDelay;
-      const aJbCount= inboundAudio.jitterBufferEmittedCount;
-      const prevAJb = prevAud ? prevAud.jitterBufferDelay : 0;
-      const prevAJbC= prevAud ? prevAud.jitterBufferEmittedCount : 0;
-      const aDJbDur = aJb - prevAJb;
-      const aDJbCnt = aJbCount - prevAJbC;
-      const aJbMs   = aDJbCnt > 0 ? (aDJbDur / aDJbCnt * 1000) : 0;
-      const akbps   = dt > 0 ? (aBytes * 8 / 1000 / dt) : 0;
-      const aLossP  = (aRecv + aLost) > 0 ? (aLost / (aRecv + aLost) * 100) : 0;
+      const aBytes   = prevAud ? (inboundAudio.bytesReceived   - prevAud.bytesReceived)   : 0;
+      const aLost    = prevAud ? (inboundAudio.packetsLost     - prevAud.packetsLost)     : 0;
+      const aRecv    = prevAud ? (inboundAudio.packetsReceived - prevAud.packetsReceived) : 0;
+      const aNack    = prevAud ? ((inboundAudio.nackCount||0)  - (prevAud.nackCount||0))  : 0;
+      const aConceal = prevAud ? ((inboundAudio.concealedSamples||0) - (prevAud.concealedSamples||0)) : 0;
+      const aSilent  = prevAud ? ((inboundAudio.silentConcealedSamples||0) - (prevAud.silentConcealedSamples||0)) : 0;
+      const aEvents  = prevAud ? ((inboundAudio.concealmentEvents||0) - (prevAud.concealmentEvents||0)) : 0;
+      const aFec     = prevAud ? ((inboundAudio.fecPacketsReceived||0) - (prevAud.fecPacketsReceived||0)) : 0;
+      const aDiscard = prevAud ? ((inboundAudio.packetsDiscarded||0) - (prevAud.packetsDiscarded||0)) : 0;
+      const aInserted= prevAud ? ((inboundAudio.insertedSamplesForDeceleration||0) - (prevAud.insertedSamplesForDeceleration||0)) : 0;
+      const aRemoved = prevAud ? ((inboundAudio.removedSamplesForAcceleration||0)  - (prevAud.removedSamplesForAcceleration||0))  : 0;
+      const aJbDelay = inboundAudio.jitterBufferDelay;
+      const aJbCount = inboundAudio.jitterBufferEmittedCount;
+      const prevAJb  = prevAud ? prevAud.jitterBufferDelay : 0;
+      const prevAJbC = prevAud ? prevAud.jitterBufferEmittedCount : 0;
+      const aJbMs    = (aJbCount - prevAJbC) > 0 ? ((aJbDelay - prevAJb) / (aJbCount - prevAJbC) * 1000) : 0;
+      const aJbTgt   = (inboundAudio.jitterBufferTarget || 0) * 1000;
+      const akbps    = dt > 0 ? (aBytes * 8 / 1000 / dt) : 0;
+      const aLossP   = (aRecv + aLost) > 0 ? (aLost / (aRecv + aLost) * 100) : 0;
       lines.push('');
       lines.push(`AUDIO`);
       lines.push(color(`bitrate    ${fmt(akbps,0)} kbps`,
                        akbps < 16 && dt > 0 ? 'warn' : ''));
       lines.push(color(`loss       ${fmt(aLossP,1)}%   (${aLost}/${aLost+aRecv})`,
                        aLossP > 2 ? 'bad' : (aLossP > 0.5 ? 'warn' : '')));
-      lines.push(`jitter buf ${fmt(aJbMs,0)} ms`);
+      lines.push(`jitter buf ${fmt(aJbMs,0)} ms   tgt ${fmt(aJbTgt,0)}`);
       lines.push(color(`nack/fec   ${aNack}/${aFec} per s`,
                        aNack > 5 ? 'warn' : ''));
-      lines.push(color(`concealed  ${aConceal} samples`,
+      lines.push(color(`concealed  ${aConceal} (${aEvents} events)`,
                        aConceal > 480 ? 'bad' : (aConceal > 0 ? 'warn' : '')));
+      lines.push(color(`  silent   ${aSilent}`,
+                       aSilent > 480 ? 'bad' : ''));
+      lines.push(color(`discarded  ${aDiscard} per s`,
+                       aDiscard > 0 ? 'warn' : ''));
+      lines.push(`accel ±     -${aRemoved} +${aInserted}`);
     }
 
     statsBox.innerHTML = lines.join('\n');
