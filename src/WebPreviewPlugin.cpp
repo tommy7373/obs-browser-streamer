@@ -664,8 +664,16 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 
         auto audioSr   = std::make_shared<rtc::RtcpSrReporter>(peer->audioRtpConfig);
         auto audioNack = std::make_shared<rtc::RtcpNackResponder>(512);
+        // Pacing: OBS's audio thread delivers Opus packets in ~60ms bursts of
+        // 3 (sometimes 100-160ms apart). Without pacing those bursts arrive
+        // at the receiver as the wire timing, busting its audio jitter buffer
+        // and showing up as concealed samples. Pace at 10ms / 200 kbps headroom
+        // so the queue drains smoothly even when bursts are large.
+        auto audioPacing = std::make_shared<rtc::PacingHandler>(
+            200000.0, std::chrono::milliseconds(10));
         audioPacketizer->addToChain(audioSr);
         audioPacketizer->addToChain(audioNack);
+        audioPacketizer->addToChain(audioPacing);
         peer->audioTrack->setMediaHandler(audioPacketizer);
 
         peer->audioTrack->onOpen([wp = std::weak_ptr<PeerInfo>(peer)]() {
