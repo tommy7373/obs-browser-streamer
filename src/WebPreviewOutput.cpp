@@ -147,7 +147,8 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
 
     // --- ffmpeg_muxer to /dev/null — we intercept packets before they hit it ---
     obs_data_t* mux = obs_data_create();
-    obs_data_set_string(mux, "path", "NUL.mp4");
+    // MPEG-TS, not MP4: NUL doesn't support seek-back for moov finalization.
+    obs_data_set_string(mux, "path", "NUL.ts");
     obsOutput_ = obs_output_create("ffmpeg_muxer", "web_preview_output", mux, nullptr);
     obs_data_release(mux);
     if (!obsOutput_) {
