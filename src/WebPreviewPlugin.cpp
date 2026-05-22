@@ -648,12 +648,8 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         const uint32_t audioSsrc = 43;
         rtc::Description::Audio audioDesc(audioMid, rtc::Description::Direction::SendOnly);
         audioDesc.addOpusCodec(opusPt);
-        if (auto* rtpMap = audioDesc.rtpMap(opusPt)) {
-            // Advertise NACK so the browser will retransmit-request missing
-            // Opus packets. With Opus in-band FEC enabled at the encoder this
-            // belt-and-suspenders setup recovers all but the largest losses.
-            rtpMap->addFeedback("nack");
-        }
+        // No NACK advertised — retransmits arrive past playout deadline and
+        // become packetsDiscarded. FEC at the encoder handles small losses.
         audioDesc.addSSRC(audioSsrc, "obs-web-preview", "obs-stream", "obs-audio-track");
         peer->audioTrack = peer->pc->addTrack(audioDesc);
 
@@ -662,18 +658,16 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
             rtc::OpusRtpPacketizer::DefaultClockRate);
         auto audioPacketizer = std::make_shared<rtc::OpusRtpPacketizer>(peer->audioRtpConfig);
 
-        auto audioSr   = std::make_shared<rtc::RtcpSrReporter>(peer->audioRtpConfig);
-        auto audioNack = std::make_shared<rtc::RtcpNackResponder>(512);
-        // Pacing: OBS's audio thread delivers Opus packets in ~60ms bursts of
-        // 3 (sometimes 100-160ms apart). Without pacing those bursts arrive
-        // at the receiver as the wire timing, busting its audio jitter buffer
-        // and showing up as concealed samples. Pace at 10ms / 200 kbps headroom
-        // so the queue drains smoothly even when bursts are large.
-        auto audioPacing = std::make_shared<rtc::PacingHandler>(
-            200000.0, std::chrono::milliseconds(10));
+        auto audioSr = std::make_shared<rtc::RtcpSrReporter>(peer->audioRtpConfig);
         audioPacketizer->addToChain(audioSr);
-        audioPacketizer->addToChain(audioNack);
-        audioPacketizer->addToChain(audioPacing);
+        // Deliberately no NACK or PacingHandler on audio:
+        //  - NACK retransmits packets that the receiver flagged as "lost",
+        //    but a retransmit arrives well after playout deadline, where
+        //    the browser counts it as packetsDiscarded → concealment.
+        //  - PacingHandler holds packets in a 10ms-tick queue, adding more
+        //    arrival delay on top of OBS's bursty encoder thread. With the
+        //    receiver-side 300ms jitter buffer already absorbing bursts,
+        //    pacing only buys late-arrival risk.
         peer->audioTrack->setMediaHandler(audioPacketizer);
 
         peer->audioTrack->onOpen([wp = std::weak_ptr<PeerInfo>(peer)]() {
