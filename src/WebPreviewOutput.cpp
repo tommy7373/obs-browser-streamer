@@ -315,12 +315,11 @@ void WebPreviewOutput::HandlePacket(encoder_packet* pkt)
     if (!active_ || !pkt || !packetCb_)
         return;
 
-    // Audio packets pass through unmodified — the WebRTC layer wraps them in
-    // RTP. Only video keyframes need the SPS/PPS prepending below.
-    if (pkt->type != OBS_ENCODER_VIDEO) {
-        packetCb_(pkt);
+    // Audio packets are produced by the dummy ffmpeg_opus encoder solely to
+    // satisfy the OBS_OUTPUT_AV null output. Real audio comes from
+    // OpusAudioCapture on the WebPreviewPlugin side. Drop these here.
+    if (pkt->type != OBS_ENCODER_VIDEO)
         return;
-    }
 
     if (pkt->keyframe) {
         if (extraData_.empty() && vidEncoder_) {
