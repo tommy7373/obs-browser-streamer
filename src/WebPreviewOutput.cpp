@@ -1,12 +1,8 @@
 #include "WebPreviewOutput.hpp"
 
 #include <obs-module.h>
-#include <util/platform.h>
-#include <media-io/video-io.h>
-#include <media-io/video-frame.h>
 
 #include <cctype>
-#include <cstdio>
 #include <cstring>
 
 // -------------------------------------------------------------------------
@@ -108,32 +104,6 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
 
     packetCb_ = std::move(cb);
 
-    // Reject texture-only encoders up-front — they pull from OBS's main GPU
-    // pipeline and produce no output when wired to a custom video_output_t,
-    // which also corrupts OBS's encoder thread for subsequent runs.
-    const char* idCheck = encoderId.empty() ? "obs_x264" : encoderId.c_str();
-    uint32_t encCaps = obs_get_encoder_caps(idCheck);
-    if (encCaps & OBS_ENCODER_CAP_PASS_TEXTURE) {
-        blog(LOG_WARNING,
-             "[obs-web-preview] encoder '%s' is texture-only and cannot be used "
-             "with a custom video pipeline — pick a fallback encoder instead "
-             "(e.g. ffmpeg_amf, obs_qsv11_h264, obs_x264)",
-             idCheck);
-        return false;
-    }
-    // Rewritten obs-nvenc (OBS 31+) hard-crashes in cuda_surface_init when an
-    // encoder is initialized against a custom video_t (it dereferences state
-    // that only exists when paired with OBS's main canvas video). Reject up
-    // front rather than letting OBS crash.
-    if (strncmp(idCheck, "obs_nvenc_", 10) == 0) {
-        blog(LOG_WARNING,
-             "[obs-web-preview] encoder '%s' is incompatible with custom video "
-             "outputs and would crash OBS — pick obs_x264, ffmpeg_amf, or "
-             "obs_qsv11_h264 instead",
-             idCheck);
-        return false;
-    }
-
     source_ = obs_get_source_by_name(sourceName.c_str());
     if (!source_)
         return false;
@@ -144,28 +114,44 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
         source_ = nullptr;
         return false;
     }
+
+    // --- obs_view_t-backed video pipeline ---
+    // The view shares OBS's main canvas video clock and graphics thread, which
+    // means encoders (including obs_nvenc_* and texture-path encoders) treat
+    // it as canvas-equivalent. This replaces the previous video_output_open +
+    // main_render_callback path, which had subtle timing-drift issues until
+    // obs_reset_video() ran.
+    //
+    // Base dimensions track the source's natural size so the source fills the
+    // view's base canvas; output dimensions follow the OBS scaled-resolution
+    // setting (typical canvas downscale path).
+    uint32_t srcW = obs_source_get_width(source_);
+    uint32_t srcH = obs_source_get_height(source_);
+    if (srcW == 0 || srcH == 0) {
+        srcW = ovi.base_width;
+        srcH = ovi.base_height;
+    }
+    ovi.base_width    = srcW;
+    ovi.base_height   = srcH;
+    // Cap output size at base size — there's no point upscaling on the
+    // encoder, the source's native pixels are all we have.
+    if (ovi.output_width  > srcW) ovi.output_width  = srcW;
+    if (ovi.output_height > srcH) ovi.output_height = srcH;
     renderWidth_  = ovi.output_width;
     renderHeight_ = ovi.output_height;
 
-    // --- Raw video output (BGRA frames we'll fill from the GPU readback) ---
-    // Name must be unique per active output, so encode the pointer.
-    char nameBuf[64];
-    snprintf(nameBuf, sizeof(nameBuf), "web_preview_vout_%p", (void*)this);
-    videoOutputName_ = nameBuf;
-
-    video_output_info voi = {};
-    voi.format     = VIDEO_FORMAT_BGRA;
-    voi.width      = renderWidth_;
-    voi.height     = renderHeight_;
-    voi.fps_num    = ovi.fps_num;
-    voi.fps_den    = ovi.fps_den;
-    voi.colorspace = ovi.colorspace;
-    voi.range      = ovi.range;
-    voi.name       = videoOutputName_.c_str();
-    voi.cache_size = 8;  // CRITICAL — without this the video_t starts with
-                          // available_frames=0 and every lock_frame() fails.
-                          // OBS clamps to MAX_CACHE_SIZE internally (typically 16).
-    if (video_output_open(&videoOutput_, &voi) != VIDEO_OUTPUT_SUCCESS) {
+    view_ = obs_view_create();
+    if (!view_) {
+        obs_source_release(source_);
+        source_ = nullptr;
+        return false;
+    }
+    obs_view_set_source(view_, 0, source_);
+    viewVideo_ = obs_view_add2(view_, &ovi);
+    if (!viewVideo_) {
+        blog(LOG_WARNING, "[obs-web-preview] obs_view_add2 returned null");
+        obs_view_destroy(view_);
+        view_ = nullptr;
         obs_source_release(source_);
         source_ = nullptr;
         return false;
@@ -213,7 +199,7 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
         TeardownPipeline();
         return false;
     }
-    obs_encoder_set_video(vidEncoder_, videoOutput_);
+    obs_encoder_set_video(vidEncoder_, viewVideo_);
 
     // --- Audio encoder (the output is declared OBS_OUTPUT_AV so we need a pair) ---
     obs_data_t* aenc = obs_data_create();
@@ -239,16 +225,10 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     obs_output_set_video_encoder(obsOutput_, vidEncoder_);
     obs_output_set_audio_encoder(obsOutput_, audEncoder_, 0);
 
-    // --- GPU resources + render callback ---
-    SetupGraphicsResources();
-    obs_add_main_render_callback(RenderCallback, this);
-
     if (!obs_output_start(obsOutput_)) {
         const char* err = obs_output_get_last_error(obsOutput_);
         blog(LOG_WARNING, "[obs-web-preview] output start failed: %s", err ? err : "(none)");
-        obs_remove_main_render_callback(RenderCallback, this);
         obs_output_remove_packet_callback(obsOutput_, PacketInterceptCb, this);
-        TeardownGraphicsResources();
         TeardownPipeline();
         return false;
     }
@@ -264,11 +244,6 @@ void WebPreviewOutput::Stop()
     if (!active_)
         return;
 
-    // Order matters here.  We set active_=false so the render callback bails
-    // immediately, but DO NOT remove the callback yet — obs_output_stop may
-    // block waiting for the encoder to drain its remaining frames, which
-    // requires the video pipeline to keep ticking.  We remove the callback
-    // only after the output has fully stopped.
     active_ = false;
 
     if (obsOutput_) {
@@ -276,88 +251,12 @@ void WebPreviewOutput::Stop()
         obs_output_stop(obsOutput_);
     }
 
-    obs_remove_main_render_callback(RenderCallback, this);
-
-    TeardownGraphicsResources();
     TeardownPipeline();
     blog(LOG_INFO, "[obs-web-preview] streaming stopped");
 }
 
 // -------------------------------------------------------------------------
-// Render callback — runs on the OBS graphics thread every frame
-// -------------------------------------------------------------------------
-
-void WebPreviewOutput::RenderCallback(void* param, uint32_t /*cx*/, uint32_t /*cy*/)
-{
-    static_cast<WebPreviewOutput*>(param)->DoRender();
-}
-
-void WebPreviewOutput::DoRender()
-{
-    if (!active_ || !source_ || !texrender_ || !stagesurface_ || !videoOutput_)
-        return;
-
-    uint32_t w = renderWidth_;
-    uint32_t h = renderHeight_;
-
-    // Source's natural size — for a scene this is OBS's base canvas dimensions
-    // (e.g. 1440p), not the output dimensions.  We set gs_ortho to this size
-    // so the source renders in its own coordinate space, while the texrender
-    // framebuffer is at the encode resolution (e.g. 1080p) — the viewport
-    // transform between the two performs the scale-down.
-    uint32_t srcW = obs_source_get_width(source_);
-    uint32_t srcH = obs_source_get_height(source_);
-    if (srcW == 0 || srcH == 0) { srcW = w; srcH = h; }
-
-    // Render source to off-screen texture
-    gs_texrender_reset(texrender_);
-    if (!gs_texrender_begin(texrender_, w, h))
-        return;
-
-    struct vec4 bg;
-    vec4_zero(&bg);
-    gs_clear(GS_CLEAR_COLOR, &bg, 1.0f, 0);
-    gs_ortho(0.0f, (float)srcW, 0.0f, (float)srcH, -100.0f, 100.0f);
-    gs_blend_state_push();
-    gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-
-    obs_source_video_render(source_);
-
-    gs_blend_state_pop();
-    gs_texrender_end(texrender_);
-
-    // Download GPU texture → CPU
-    gs_texture_t* tex = gs_texrender_get_texture(texrender_);
-    if (!tex)
-        return;
-    gs_stage_texture(stagesurface_, tex);
-
-    uint8_t*  data     = nullptr;
-    uint32_t  linesize = 0;
-    if (!gs_stagesurface_map(stagesurface_, &data, &linesize))
-        return;
-
-    struct video_frame frame = {};
-    uint64_t ts = os_gettime_ns();
-    if (video_output_lock_frame(videoOutput_, &frame, 1, ts)) {
-        if (frame.data[0]) {
-            uint8_t* dst = frame.data[0];
-            uint8_t* src = data;
-            uint32_t dst_ls = frame.linesize[0];
-            for (uint32_t row = 0; row < h; row++) {
-                memcpy(dst, src, w * 4);
-                dst += dst_ls;
-                src += linesize;
-            }
-        }
-        video_output_unlock_frame(videoOutput_);
-    }
-
-    gs_stagesurface_unmap(stagesurface_);
-}
-
-// -------------------------------------------------------------------------
-// SPS/PPS helpers (unchanged from previous canvas-based implementation)
+// SPS/PPS helpers
 // -------------------------------------------------------------------------
 
 static bool PacketHasParameterSets(const uint8_t* d, size_t size)
@@ -437,30 +336,8 @@ void WebPreviewOutput::HandlePacket(encoder_packet* pkt)
 }
 
 // -------------------------------------------------------------------------
-// Graphics + pipeline teardown
+// Pipeline teardown
 // -------------------------------------------------------------------------
-
-void WebPreviewOutput::SetupGraphicsResources()
-{
-    obs_enter_graphics();
-    texrender_    = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-    stagesurface_ = gs_stagesurface_create(renderWidth_, renderHeight_, GS_BGRA);
-    obs_leave_graphics();
-}
-
-void WebPreviewOutput::TeardownGraphicsResources()
-{
-    obs_enter_graphics();
-    if (texrender_) {
-        gs_texrender_destroy(texrender_);
-        texrender_ = nullptr;
-    }
-    if (stagesurface_) {
-        gs_stagesurface_destroy(stagesurface_);
-        stagesurface_ = nullptr;
-    }
-    obs_leave_graphics();
-}
 
 void WebPreviewOutput::TeardownPipeline()
 {
@@ -479,9 +356,13 @@ void WebPreviewOutput::TeardownPipeline()
         obs_encoder_release(vidEncoder_);
         vidEncoder_ = nullptr;
     }
-    if (videoOutput_) {
-        video_output_close(videoOutput_);
-        videoOutput_ = nullptr;
+    if (view_) {
+        // obs_view_remove unhooks the view's video_t from the main render
+        // loop. After this returns, no more frames are produced.
+        obs_view_remove(view_);
+        viewVideo_ = nullptr;
+        obs_view_destroy(view_);
+        view_ = nullptr;
     }
     if (source_) {
         obs_source_release(source_);
