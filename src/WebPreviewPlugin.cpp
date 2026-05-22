@@ -87,7 +87,7 @@ bool WebPreviewPlugin::Start(int idx)
 
     bool started = s.output->Start(configs_[idx].sourceName, configs_[idx].encoderId,
         configs_[idx].bitrateKbps,
-        [this, idx](encoder_packet* pkt) { FeedVideoPacket(idx, pkt); });
+        [this, idx](encoder_packet* pkt) { FeedPacket(idx, pkt); });
     if (!started)
         return false;
 
@@ -193,9 +193,9 @@ std::vector<std::string> WebPreviewPlugin::GetLandingUrls() const
     return urls;
 }
 
-void WebPreviewPlugin::FeedVideoPacket(int idx, encoder_packet* pkt)
+void WebPreviewPlugin::FeedPacket(int idx, encoder_packet* pkt)
 {
-    if (idx < 0 || idx >= numStreams_)
+    if (idx < 0 || idx >= numStreams_ || !pkt)
         return;
     auto& s = streams_[idx];
     if (!s.streaming)
@@ -482,34 +482,45 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
     }
 
     // Parse the offer for the video m-section's mid plus all H264 PTs and
-    // their packetization-mode.  Chrome (Unified Plan) is strict: the answer
-    // m-section's mid MUST match the offer's mid, and the negotiated H264 PT
-    // MUST have a consistent packetization-mode between offer and answer.
+    // their packetization-mode, and the audio m-section's mid plus Opus PT.
+    // Chrome (Unified Plan) is strict: the answer m-section's mid MUST match
+    // the offer's mid, and the negotiated H264 PT MUST have a consistent
+    // packetization-mode between offer and answer.
     struct H264Offer { int pt = -1; int mode = 0; std::string profileLevelId; };
     std::vector<H264Offer> h264Offers;
     std::string videoMid = "video";
+    std::string audioMid = "audio";
+    int  opusPt        = -1;
+    bool hasAudio      = false;
     {
         std::istringstream iss(offerSdp);
         std::string line;
-        bool inVideo = false;
+        enum { None, Video, Audio } section = None;
         bool gotVideoMid = false;
+        bool gotAudioMid = false;
         while (std::getline(iss, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.rfind("m=", 0) == 0) {
-                inVideo = (line.rfind("m=video", 0) == 0);
+                if      (line.rfind("m=video", 0) == 0) section = Video;
+                else if (line.rfind("m=audio", 0) == 0) { section = Audio; hasAudio = true; }
+                else                                    section = None;
                 continue;
             }
-            if (inVideo && !gotVideoMid && line.rfind("a=mid:", 0) == 0) {
+            if (section == Video && !gotVideoMid && line.rfind("a=mid:", 0) == 0) {
                 videoMid = line.substr(6);
                 gotVideoMid = true;
             }
-            if (inVideo && line.rfind("a=rtpmap:", 0) == 0 &&
+            if (section == Audio && !gotAudioMid && line.rfind("a=mid:", 0) == 0) {
+                audioMid = line.substr(6);
+                gotAudioMid = true;
+            }
+            if (section == Video && line.rfind("a=rtpmap:", 0) == 0 &&
                 (line.find("H264/") != std::string::npos ||
                  line.find("h264/") != std::string::npos)) {
                 int pt = 0;
                 if (sscanf(line.c_str(), "a=rtpmap:%d", &pt) == 1)
                     h264Offers.push_back({pt, 0, ""});
-            } else if (inVideo && line.rfind("a=fmtp:", 0) == 0) {
+            } else if (section == Video && line.rfind("a=fmtp:", 0) == 0) {
                 int pt = 0;
                 if (sscanf(line.c_str(), "a=fmtp:%d", &pt) == 1) {
                     for (auto& e : h264Offers) {
@@ -521,6 +532,13 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
                             e.profileLevelId = line.substr(pos + 17, 6);
                     }
                 }
+            } else if (section == Audio && opusPt < 0 &&
+                       line.rfind("a=rtpmap:", 0) == 0 &&
+                       (line.find("opus/") != std::string::npos ||
+                        line.find("OPUS/") != std::string::npos)) {
+                int pt = 0;
+                if (sscanf(line.c_str(), "a=rtpmap:%d", &pt) == 1)
+                    opusPt = pt;
             }
         }
     }
@@ -625,6 +643,35 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
         }
     });
 
+    // --- Audio track (Opus) ---
+    if (hasAudio && opusPt >= 0) {
+        const uint32_t audioSsrc = 43;
+        rtc::Description::Audio audioDesc(audioMid, rtc::Description::Direction::SendOnly);
+        audioDesc.addOpusCodec(opusPt);
+        audioDesc.addSSRC(audioSsrc, "obs-web-preview", "obs-stream", "obs-audio-track");
+        peer->audioTrack = peer->pc->addTrack(audioDesc);
+
+        peer->audioRtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            audioSsrc, "obs-web-preview", opusPt,
+            rtc::OpusRtpPacketizer::DefaultClockRate);
+        auto audioPacketizer = std::make_shared<rtc::OpusRtpPacketizer>(peer->audioRtpConfig);
+
+        // Sender Reports for audio too — Chrome needs them for the inbound-rtp
+        // entry on the receive side.
+        auto audioSr = std::make_shared<rtc::RtcpSrReporter>(peer->audioRtpConfig);
+        audioPacketizer->addToChain(audioSr);
+        peer->audioTrack->setMediaHandler(audioPacketizer);
+
+        peer->audioTrack->onOpen([wp = std::weak_ptr<PeerInfo>(peer)]() {
+            if (auto p = wp.lock()) p->audioReady = true;
+        });
+
+        blog(LOG_INFO, "[obs-web-preview] audio: Opus PT=%d mid='%s'", opusPt, audioMid.c_str());
+    } else {
+        blog(LOG_INFO, "[obs-web-preview] no audio in offer (hasAudio=%d opusPt=%d)",
+             hasAudio ? 1 : 0, opusPt);
+    }
+
     peer->pc->setLocalDescription(); // creates answer + starts ICE gathering
 
     auto answerFuture = answerPromise.get_future();
@@ -659,12 +706,14 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 
 void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream)
 {
-    double ptsSeconds = static_cast<double>(pkt->pts)
-                      * pkt->timebase_num / pkt->timebase_den;
-    uint32_t rtpTs = static_cast<uint32_t>(ptsSeconds * 90000.0);
+    const bool isAudio = (pkt->type == OBS_ENCODER_AUDIO);
+    const uint32_t clockRate = isAudio ? 48000u : 90000u;
+    const double ptsSeconds  = static_cast<double>(pkt->pts)
+                             * pkt->timebase_num / pkt->timebase_den;
+    const uint32_t rtpTs     = static_cast<uint32_t>(ptsSeconds * clockRate);
 
-    // Cache keyframes so new peers receive them immediately on connect.
-    if (pkt->keyframe) {
+    // Cache video keyframes so new peers receive them immediately on connect.
+    if (!isAudio && pkt->keyframe) {
         std::lock_guard<std::mutex> kfLock(stream.keyframeCache->mutex);
         stream.keyframeCache->data.assign(pkt->data, pkt->data + pkt->size);
         stream.keyframeCache->rtpTimestamp = rtpTs;
@@ -676,7 +725,21 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
     if (stream.activePeers.empty())
         return;
 
+    auto* bytes = reinterpret_cast<const std::byte*>(pkt->data);
+
     for (auto& peer : stream.activePeers) {
+        if (isAudio) {
+            if (!peer->audioReady || !peer->audioTrack || !peer->audioRtpConfig)
+                continue;
+            try {
+                peer->audioRtpConfig->timestamp = rtpTs;
+                peer->audioTrack->send(bytes, pkt->size);
+            } catch (...) {
+                peer->dead = true;
+            }
+            continue;
+        }
+
         if (!peer->ready)
             continue;
         // After a PLI or on first connect, withhold non-keyframes — a peer that
@@ -685,7 +748,6 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
             continue;
         try {
             peer->rtpConfig->timestamp = rtpTs;
-            auto* bytes = reinterpret_cast<const std::byte*>(pkt->data);
             peer->track->send(bytes, pkt->size);
             if (pkt->keyframe)
                 peer->needsKeyframe.store(false);

@@ -64,7 +64,7 @@ static struct obs_output_info null_output_info = {
     /* get_congestion        */ nullptr,
     /* get_connect_time_ms   */ nullptr,
     /* encoded_video_codecs  */ "h264",
-    /* encoded_audio_codecs  */ "aac",
+    /* encoded_audio_codecs  */ "opus",
     /* raw_audio2            */ nullptr,
     /* protocols             */ nullptr,
 };
@@ -201,10 +201,11 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     }
     obs_encoder_set_video(vidEncoder_, viewVideo_);
 
-    // --- Audio encoder (the output is declared OBS_OUTPUT_AV so we need a pair) ---
+    // --- Audio encoder — Opus is the only audio codec WebRTC requires every
+    // browser to support. ffmpeg_opus is bundled with OBS via obs-ffmpeg.
     obs_data_t* aenc = obs_data_create();
     obs_data_set_int(aenc, "bitrate", 128);
-    audEncoder_ = obs_audio_encoder_create("ffmpeg_aac", "web_preview_aenc", aenc, 0, nullptr);
+    audEncoder_ = obs_audio_encoder_create("ffmpeg_opus", "web_preview_aenc", aenc, 0, nullptr);
     obs_data_release(aenc);
     if (!audEncoder_) {
         TeardownPipeline();
@@ -308,8 +309,15 @@ static std::vector<uint8_t> ExtraDataToAnnexB(const uint8_t* data, size_t size)
 
 void WebPreviewOutput::HandlePacket(encoder_packet* pkt)
 {
-    if (!active_ || !pkt || pkt->type != OBS_ENCODER_VIDEO || !packetCb_)
+    if (!active_ || !pkt || !packetCb_)
         return;
+
+    // Audio packets pass through unmodified — the WebRTC layer wraps them in
+    // RTP. Only video keyframes need the SPS/PPS prepending below.
+    if (pkt->type != OBS_ENCODER_VIDEO) {
+        packetCb_(pkt);
+        return;
+    }
 
     if (pkt->keyframe) {
         if (extraData_.empty() && vidEncoder_) {

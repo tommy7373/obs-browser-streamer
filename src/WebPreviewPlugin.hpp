@@ -16,9 +16,12 @@ static constexpr int kMaxStreams = 8;
 
 struct PeerInfo {
     std::shared_ptr<rtc::PeerConnection>         pc;
-    std::shared_ptr<rtc::Track>                  track;
-    std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig;
-    std::atomic<bool> ready{false};
+    std::shared_ptr<rtc::Track>                  track;          // video
+    std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig;      // video
+    std::shared_ptr<rtc::Track>                  audioTrack;
+    std::shared_ptr<rtc::RtpPacketizationConfig> audioRtpConfig;
+    std::atomic<bool> ready{false};                              // video track open
+    std::atomic<bool> audioReady{false};
     std::atomic<bool> dead{false};
     // Set on connect and on PLI receipt; non-IDR packets are withheld until
     // the next keyframe so a desynchronised peer resumes cleanly.
@@ -70,7 +73,7 @@ public:
 
     void LoadSettings();
     void SaveSettings();
-    void FeedVideoPacket(int idx, encoder_packet* pkt);
+    void FeedPacket(int idx, encoder_packet* pkt);
 
 private:
     StreamState  streams_[kMaxStreams];

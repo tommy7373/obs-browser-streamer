@@ -65,9 +65,15 @@
   .ctrl:active { background: rgba(255,255,255,.25); }
   #rotbtn  { bottom: 20px; right: 20px; }
   #fsbtn   { bottom: 20px; right: 140px; }
+  #mutebtn { bottom: 20px; right: 260px; font-size: 38px; }
   #backbtn { bottom: 20px; left: 20px; font-size: 36px; }
   #statsbtn{ top: 20px; right: 20px; width: 64px; height: 64px;
              font-size: 26px; line-height: 64px; }
+
+  /* Fade chrome away after idle. The stats panel is excluded —
+     when toggled on it stays visible regardless of activity. */
+  .chrome { transition: opacity .35s ease-out; }
+  body.idle .chrome { opacity: 0; pointer-events: none; }
 
   #stats {
     position: fixed;
@@ -90,12 +96,13 @@
 </head>
 <body>
 <video id="v" autoplay playsinline muted></video>
-<div id="status">Connecting…</div>
+<div id="status" class="chrome">Connecting…</div>
 <div id="stats"></div>
-<button id="backbtn" class="ctrl" title="Back">⬅</button>
-<button id="fsbtn"   class="ctrl" title="Fullscreen">⛶</button>
-<button id="rotbtn"  class="ctrl" title="Rotate">⟳</button>
-<button id="statsbtn" class="ctrl" title="Stats">📊</button>
+<button id="backbtn"  class="ctrl chrome" title="Back">⬅</button>
+<button id="fsbtn"    class="ctrl chrome" title="Fullscreen">⛶</button>
+<button id="mutebtn"  class="ctrl chrome" title="Unmute">🔇</button>
+<button id="rotbtn"   class="ctrl chrome" title="Rotate">⟳</button>
+<button id="statsbtn" class="ctrl chrome" title="Stats">📊</button>
 
 <script>
 (async function() {
@@ -103,9 +110,33 @@
   const status   = document.getElementById('status');
   const rotbtn   = document.getElementById('rotbtn');
   const fsbtn    = document.getElementById('fsbtn');
+  const mutebtn  = document.getElementById('mutebtn');
   const backbtn  = document.getElementById('backbtn');
   const statsbtn = document.getElementById('statsbtn');
   const statsBox = document.getElementById('stats');
+
+  // Browsers require a user gesture to unmute autoplaying media. The
+  // <video> element starts muted; this button flips it once the user taps.
+  function updateMuteIcon() { mutebtn.textContent = video.muted ? '🔇' : '🔊'; }
+  mutebtn.addEventListener('click', () => {
+    video.muted = !video.muted;
+    if (!video.muted) video.play().catch(() => {});
+    updateMuteIcon();
+  });
+  video.addEventListener('volumechange', updateMuteIcon);
+
+  // --- Chrome auto-fade ---
+  // After ~3s of no pointer / touch / key activity the controls fade out.
+  // Any interaction restores them and restarts the timer.
+  let idleTimer = null;
+  function showChrome() {
+    document.body.classList.remove('idle');
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => document.body.classList.add('idle'), 3000);
+  }
+  ['mousemove', 'mousedown', 'touchstart', 'keydown', 'wheel']
+    .forEach(ev => window.addEventListener(ev, showChrome, { passive: true }));
+  showChrome();
 
   let statsVisible = false;
   let statsTimer   = null;
@@ -256,16 +287,18 @@
     startStatsPolling(pc);
 
     pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    // Collect tracks into a single MediaStream so audio + video stay synced
+    // and arrive together on the <video> element regardless of which ontrack
+    // event fires first.
+    const remoteStream = new MediaStream();
+    video.srcObject = remoteStream;
 
     pc.ontrack = (e) => {
-      // Chrome fires ontrack with an empty streams array when the answer SDP
-      // has no a=msid; Firefox creates a default stream.  Handle both.
-      const stream = (e.streams && e.streams.length > 0)
-        ? e.streams[0]
-        : new MediaStream([e.track]);
-      video.srcObject = stream;
+      remoteStream.addTrack(e.track);
       video.play().catch(() => {});
-      setStatus('Live', true);
+      if (e.track.kind === 'video') setStatus('Live', true);
 
       // Small 100ms jitter buffer — Chrome is fine at 0 but Firefox stutters
       // without a buffer to absorb decode timing variance.  NACK (handled by
