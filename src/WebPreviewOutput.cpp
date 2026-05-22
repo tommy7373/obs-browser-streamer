@@ -48,7 +48,19 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
         blog(LOG_WARNING,
              "[obs-web-preview] encoder '%s' is texture-only and cannot be used "
              "with a custom video pipeline — pick a fallback encoder instead "
-             "(e.g. ffmpeg_nvenc, ffmpeg_amf, obs_qsv11_h264, obs_x264)",
+             "(e.g. ffmpeg_amf, obs_qsv11_h264, obs_x264)",
+             idCheck);
+        return false;
+    }
+    // Rewritten obs-nvenc (OBS 31+) hard-crashes in cuda_surface_init when an
+    // encoder is initialized against a custom video_t (it dereferences state
+    // that only exists when paired with OBS's main canvas video). Reject up
+    // front rather than letting OBS crash.
+    if (strncmp(idCheck, "obs_nvenc_", 10) == 0) {
+        blog(LOG_WARNING,
+             "[obs-web-preview] encoder '%s' is incompatible with custom video "
+             "outputs and would crash OBS — pick obs_x264, ffmpeg_amf, or "
+             "obs_qsv11_h264 instead",
              idCheck);
         return false;
     }

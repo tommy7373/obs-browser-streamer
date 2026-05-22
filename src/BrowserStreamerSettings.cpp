@@ -194,6 +194,12 @@ void BrowserStreamerSettings::PopulateEncoders(QComboBox* combo, const QString& 
             continue;  // skip texture-only encoders
         if (caps & OBS_ENCODER_CAP_DEPRECATED)
             continue;
+        // The rewritten obs-nvenc (OBS 31+) crashes in cuda_surface_init when
+        // the encoder is paired with a custom video_t — it assumes the main
+        // canvas video. Hide all obs_nvenc_* ids; legacy ffmpeg_nvenc still
+        // works on older OBS and is unaffected.
+        if (strncmp(id, "obs_nvenc_", 10) == 0)
+            continue;
         const char* display = obs_encoder_get_display_name(id);
         entries.push_back({QString::fromUtf8(id),
                            QString::fromUtf8(display ? display : id)});
