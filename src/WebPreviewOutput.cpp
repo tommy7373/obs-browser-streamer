@@ -145,10 +145,19 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     }
     obs_encoder_set_audio(audEncoder_, obs_get_audio());
 
-    // --- ffmpeg_muxer to /dev/null — we intercept packets before they hit it ---
+    // --- ffmpeg_muxer — we intercept packets before they hit the muxer, but
+    // it still needs a writable file path to start (NUL fails on some Windows
+    // setups due to Controlled Folder Access or ffmpeg avio treating it as a
+    // regular file). Write a small discard file inside OBS's own config dir,
+    // which is always writable and already trusted by ransomware protection.
+    // MPEG-TS so no seek-back is required on close.
     obs_data_t* mux = obs_data_create();
-    // MPEG-TS, not MP4: NUL doesn't support seek-back for moov finalization.
-    obs_data_set_string(mux, "path", "NUL.ts");
+    char cfgDir[512] = {0};
+    os_get_config_path(cfgDir, sizeof(cfgDir),
+                       "obs-studio/plugin_config/obs-web-preview");
+    os_mkdirs(cfgDir);
+    discardPath_ = std::string(cfgDir) + "/discard.ts";
+    obs_data_set_string(mux, "path", discardPath_.c_str());
     obsOutput_ = obs_output_create("ffmpeg_muxer", "web_preview_output", mux, nullptr);
     obs_data_release(mux);
     if (!obsOutput_) {
@@ -387,6 +396,11 @@ void WebPreviewOutput::TeardownPipeline()
 {
     extraData_.clear();
     kfBuffer_.clear();
+
+    if (!discardPath_.empty()) {
+        os_unlink(discardPath_.c_str());
+        discardPath_.clear();
+    }
 
     if (obsOutput_) {
         obs_output_release(obsOutput_);

@@ -48,6 +48,7 @@ private:
     uint32_t        renderWidth_  = 0;
     uint32_t        renderHeight_ = 0;
     std::string     videoOutputName_;
+    std::string     discardPath_;
 
     std::atomic<bool>    active_{false};
     PacketCallback       packetCb_;
