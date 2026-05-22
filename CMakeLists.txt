@@ -13,13 +13,19 @@ find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
 find_package(LibDataChannel REQUIRED)
 qt_standard_project_setup()
 
+# avcodec for our inline Opus encoder (OpusAudioCapture). Bundled in obs-deps;
+# the configured CMAKE_PREFIX_PATH already points there.
+find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h REQUIRED)
+find_library(AVCODEC_LIBRARY NAMES avcodec REQUIRED)
+find_library(AVUTIL_LIBRARY  NAMES avutil  REQUIRED)
+
 add_library(obs-web-preview MODULE
     src/plugin-main.cpp
     src/WebPreviewPlugin.cpp
     src/WebPreviewOutput.cpp
     src/WebPreviewDock.cpp
     src/BrowserStreamerSettings.cpp
-    src/AudioPacer.cpp
+    src/OpusAudioCapture.cpp
 )
 
 target_link_libraries(obs-web-preview PRIVATE
@@ -28,7 +34,11 @@ target_link_libraries(obs-web-preview PRIVATE
     Qt6::Core
     Qt6::Widgets
     LibDataChannel::LibDataChannel
+    ${AVCODEC_LIBRARY}
+    ${AVUTIL_LIBRARY}
 )
+
+target_include_directories(obs-web-preview PRIVATE ${AVCODEC_INCLUDE_DIR})
 
 target_include_directories(obs-web-preview PRIVATE src third-party)
 

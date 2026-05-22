@@ -1,6 +1,6 @@
 #include "WebPreviewPlugin.hpp"
 #include "WebPreviewOutput.hpp"
-#include "AudioPacer.hpp"
+#include "OpusAudioCapture.hpp"
 
 #include <rtc/plihandler.hpp>
 #include <rtc/rtcpnackresponder.hpp>
@@ -41,8 +41,8 @@
 WebPreviewPlugin::WebPreviewPlugin()
 {
     for (int i = 0; i < kMaxStreams; ++i) {
-        streams_[i].output     = std::make_unique<WebPreviewOutput>();
-        streams_[i].audioPacer = std::make_unique<AudioPacer>();
+        streams_[i].output       = std::make_unique<WebPreviewOutput>();
+        streams_[i].audioCapture = std::make_unique<OpusAudioCapture>();
     }
 
     for (int i = 0; i < kMaxStreams; ++i)
@@ -94,11 +94,13 @@ bool WebPreviewPlugin::Start(int idx)
     if (!started)
         return false;
 
-    // Start the per-stream audio pacer. Callback runs on the pacer's worker
-    // thread; it does the per-peer fan-out at the paced wallclock time.
-    s.audioPacer->Start([this, idx](const uint8_t* data, size_t size, uint32_t rtpTs) {
-        SendAudioToPeers(idx, data, size, rtpTs);
-    });
+    // Start inline Opus capture: pulls raw PCM from OBS, encodes on its own
+    // worker thread at strict 20ms wallclock intervals, fires the callback
+    // with the encoded packet bytes + RTP timestamp.
+    s.audioCapture->Start(128 /* kbps */,
+        [this, idx](const uint8_t* data, size_t size, uint32_t rtpTs) {
+            SendAudioToPeers(idx, data, size, rtpTs);
+        });
 
     EnsureServerRunning();
     s.streaming = true;
@@ -115,7 +117,7 @@ void WebPreviewPlugin::Stop(int idx)
 
     s.streaming = false;
     s.output->Stop();
-    s.audioPacer->Stop();
+    s.audioCapture->Stop();
 
     {
         std::lock_guard<std::mutex> lock(s.peersMutex);
@@ -210,50 +212,10 @@ void WebPreviewPlugin::FeedPacket(int idx, encoder_packet* pkt)
     auto& s = streams_[idx];
     if (!s.streaming)
         return;
-
-    if (pkt->type == OBS_ENCODER_AUDIO) {
-        // Audio: hand to the pacer. It'll fire SendAudioToPeers at the
-        // wallclock time implied by the packet's RTP timestamp, so the
-        // on-wire spacing matches the playout schedule the receiver
-        // derives from the RTP clock — even when OBS delivers packets
-        // in bursts.
-        const double ptsSeconds = static_cast<double>(pkt->pts)
-                                * pkt->timebase_num / pkt->timebase_den;
-        const uint32_t rtpTs    = static_cast<uint32_t>(ptsSeconds * 48000.0);
-
-        // Diagnostic: report clock drift between our wallclock and the audio
-        // sample timeline. If they diverge, OBS's audio output rate doesn't
-        // match what we're claiming in RTP — that drift would explain
-        // packetsDiscarded climbing in 10-15s windows even with perfect
-        // send-side pacing.
-        {
-            static uint64_t firstWallNs = 0;
-            static int64_t  firstPts    = -1;
-            static int      pktCount    = 0;
-            const uint64_t nowNs = os_gettime_ns();
-            if (firstWallNs == 0) {
-                firstWallNs = nowNs;
-                firstPts    = (int64_t)pkt->pts;
-            }
-            pktCount++;
-            if (pktCount % 250 == 0) { // ~every 5s at 20ms frames
-                const int64_t dPts = (int64_t)pkt->pts - firstPts;
-                const int64_t ptsMs =
-                    (int64_t)((double)dPts * pkt->timebase_num
-                              / pkt->timebase_den * 1000.0);
-                const int64_t wallMs = (int64_t)((nowNs - firstWallNs) / 1'000'000ULL);
-                blog(LOG_INFO,
-                     "[obs-web-preview] audio clock: wall=%lldms pts=%lldms drift=%+lldms",
-                     (long long)wallMs, (long long)ptsMs,
-                     (long long)(wallMs - ptsMs));
-            }
-        }
-
-        s.audioPacer->Enqueue(pkt->data, pkt->size, rtpTs);
-        return;
-    }
-
-    FeedVideoToPeers(pkt, s);
+    // Only video reaches us via this path now — audio is pumped directly
+    // by OpusAudioCapture which calls SendAudioToPeers from its worker.
+    if (pkt->type == OBS_ENCODER_VIDEO)
+        FeedVideoToPeers(pkt, s);
 }
 
 // -------------------------------------------------------------------------

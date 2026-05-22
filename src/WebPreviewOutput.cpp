@@ -44,7 +44,7 @@ static void null_output_packet(void*, encoder_packet*) {}
 
 static struct obs_output_info null_output_info = {
     /* id                    */ "obs_web_preview_null_output",
-    /* flags                 */ OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED,
+    /* flags                 */ OBS_OUTPUT_VIDEO | OBS_OUTPUT_ENCODED,
     /* get_name              */ null_output_get_name,
     /* create                */ null_output_create,
     /* destroy               */ null_output_destroy,
@@ -64,7 +64,7 @@ static struct obs_output_info null_output_info = {
     /* get_congestion        */ nullptr,
     /* get_connect_time_ms   */ nullptr,
     /* encoded_video_codecs  */ "h264",
-    /* encoded_audio_codecs  */ "opus",
+    /* encoded_audio_codecs  */ nullptr,
     /* raw_audio2            */ nullptr,
     /* protocols             */ nullptr,
 };
@@ -201,27 +201,10 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
     }
     obs_encoder_set_video(vidEncoder_, viewVideo_);
 
-    // --- Audio encoder — Opus is the only audio codec WebRTC requires every
-    // browser to support. ffmpeg_opus is bundled with OBS via obs-ffmpeg.
-    // Enable in-band FEC: Opus can reconstruct a lost packet using redundancy
-    // carried in the next packet, which is exactly the right tool for the
-    // occasional WiFi drop that NACK can't recover in time (audio has a much
-    // tighter latency budget than video).
-    // Force 20ms frame duration via ffmpeg_opts: ffmpeg_opus otherwise defaults
-    // to 60ms (libavcodec), which arrives in 60ms wallclock bursts and trips
-    // WebRTC audio jitter buffers tuned for 20ms — heard as periodic stutter.
-    obs_data_t* aenc = obs_data_create();
-    obs_data_set_int(aenc, "bitrate", 128);
-    audEncoder_ = obs_audio_encoder_create("ffmpeg_opus", "web_preview_aenc", aenc, 0, nullptr);
-    obs_data_release(aenc);
-    if (!audEncoder_) {
-        TeardownPipeline();
-        return false;
-    }
-    obs_encoder_set_audio(audEncoder_, obs_get_audio());
-
-    // --- Null output — hosts the encoder pipeline, writes nothing. We pull
-    // packets via obs_output_add_packet_callback below.
+    // --- Null output — hosts only the video encoder. Audio is captured
+    // and encoded separately by OpusAudioCapture (owned by WebPreviewPlugin),
+    // completely out-of-band from OBS's output infrastructure. That way the
+    // audio encoder thread isn't gated by OBS's bursty audio scheduling.
     obsOutput_ = obs_output_create("obs_web_preview_null_output",
                                    "web_preview_output", nullptr, nullptr);
     if (!obsOutput_) {
@@ -231,7 +214,6 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
 
     obs_output_add_packet_callback(obsOutput_, PacketInterceptCb, this);
     obs_output_set_video_encoder(obsOutput_, vidEncoder_);
-    obs_output_set_audio_encoder(obsOutput_, audEncoder_, 0);
 
     if (!obs_output_start(obsOutput_)) {
         const char* err = obs_output_get_last_error(obsOutput_);
@@ -362,10 +344,6 @@ void WebPreviewOutput::TeardownPipeline()
     if (obsOutput_) {
         obs_output_release(obsOutput_);
         obsOutput_ = nullptr;
-    }
-    if (audEncoder_) {
-        obs_encoder_release(audEncoder_);
-        audEncoder_ = nullptr;
     }
     if (vidEncoder_) {
         obs_encoder_release(vidEncoder_);

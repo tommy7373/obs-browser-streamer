@@ -11,7 +11,7 @@
 
 namespace httplib { class Server; class Request; class Response; }
 class WebPreviewOutput;
-class AudioPacer;
+class OpusAudioCapture;
 
 static constexpr int kMaxStreams = 8;
 
@@ -39,7 +39,7 @@ struct KeyframeCache {
 
 struct StreamState {
     std::unique_ptr<WebPreviewOutput>      output;
-    std::unique_ptr<AudioPacer>            audioPacer;
+    std::unique_ptr<OpusAudioCapture>      audioCapture;
     std::mutex                             peersMutex;
     std::vector<std::shared_ptr<PeerInfo>> activePeers;
     std::atomic<bool>                      streaming{false};
