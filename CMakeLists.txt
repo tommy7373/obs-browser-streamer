@@ -19,6 +19,7 @@ add_library(obs-web-preview MODULE
     src/WebPreviewOutput.cpp
     src/WebPreviewDock.cpp
     src/BrowserStreamerSettings.cpp
+    src/AudioPacer.cpp
 )
 
 target_link_libraries(obs-web-preview PRIVATE

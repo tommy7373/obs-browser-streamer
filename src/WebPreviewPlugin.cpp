@@ -1,5 +1,6 @@
 #include "WebPreviewPlugin.hpp"
 #include "WebPreviewOutput.hpp"
+#include "AudioPacer.hpp"
 
 #include <rtc/plihandler.hpp>
 #include <rtc/rtcpnackresponder.hpp>
@@ -39,8 +40,10 @@
 
 WebPreviewPlugin::WebPreviewPlugin()
 {
-    for (int i = 0; i < kMaxStreams; ++i)
-        streams_[i].output = std::make_unique<WebPreviewOutput>();
+    for (int i = 0; i < kMaxStreams; ++i) {
+        streams_[i].output     = std::make_unique<WebPreviewOutput>();
+        streams_[i].audioPacer = std::make_unique<AudioPacer>();
+    }
 
     for (int i = 0; i < kMaxStreams; ++i)
         configs_[i].name = "Stream " + std::to_string(i + 1);
@@ -91,6 +94,12 @@ bool WebPreviewPlugin::Start(int idx)
     if (!started)
         return false;
 
+    // Start the per-stream audio pacer. Callback runs on the pacer's worker
+    // thread; it does the per-peer fan-out at the paced wallclock time.
+    s.audioPacer->Start([this, idx](const uint8_t* data, size_t size, uint32_t rtpTs) {
+        SendAudioToPeers(idx, data, size, rtpTs);
+    });
+
     EnsureServerRunning();
     s.streaming = true;
     return true;
@@ -106,6 +115,7 @@ void WebPreviewPlugin::Stop(int idx)
 
     s.streaming = false;
     s.output->Stop();
+    s.audioPacer->Stop();
 
     {
         std::lock_guard<std::mutex> lock(s.peersMutex);
@@ -200,7 +210,50 @@ void WebPreviewPlugin::FeedPacket(int idx, encoder_packet* pkt)
     auto& s = streams_[idx];
     if (!s.streaming)
         return;
-    FeedPacketToPool(pkt, s);
+
+    if (pkt->type == OBS_ENCODER_AUDIO) {
+        // Audio: hand to the pacer. It'll fire SendAudioToPeers at the
+        // wallclock time implied by the packet's RTP timestamp, so the
+        // on-wire spacing matches the playout schedule the receiver
+        // derives from the RTP clock — even when OBS delivers packets
+        // in bursts.
+        const double ptsSeconds = static_cast<double>(pkt->pts)
+                                * pkt->timebase_num / pkt->timebase_den;
+        const uint32_t rtpTs    = static_cast<uint32_t>(ptsSeconds * 48000.0);
+
+        // Diagnostic: report clock drift between our wallclock and the audio
+        // sample timeline. If they diverge, OBS's audio output rate doesn't
+        // match what we're claiming in RTP — that drift would explain
+        // packetsDiscarded climbing in 10-15s windows even with perfect
+        // send-side pacing.
+        {
+            static uint64_t firstWallNs = 0;
+            static int64_t  firstPts    = -1;
+            static int      pktCount    = 0;
+            const uint64_t nowNs = os_gettime_ns();
+            if (firstWallNs == 0) {
+                firstWallNs = nowNs;
+                firstPts    = (int64_t)pkt->pts;
+            }
+            pktCount++;
+            if (pktCount % 250 == 0) { // ~every 5s at 20ms frames
+                const int64_t dPts = (int64_t)pkt->pts - firstPts;
+                const int64_t ptsMs =
+                    (int64_t)((double)dPts * pkt->timebase_num
+                              / pkt->timebase_den * 1000.0);
+                const int64_t wallMs = (int64_t)((nowNs - firstWallNs) / 1'000'000ULL);
+                blog(LOG_INFO,
+                     "[obs-web-preview] audio clock: wall=%lldms pts=%lldms drift=%+lldms",
+                     (long long)wallMs, (long long)ptsMs,
+                     (long long)(wallMs - ptsMs));
+            }
+        }
+
+        s.audioPacer->Enqueue(pkt->data, pkt->size, rtpTs);
+        return;
+    }
+
+    FeedVideoToPeers(pkt, s);
 }
 
 // -------------------------------------------------------------------------
@@ -712,43 +765,13 @@ void WebPreviewPlugin::HandleOfferRequest(const httplib::Request& req, httplib::
 // Video packet feeding — called from OBS encoder thread
 // -------------------------------------------------------------------------
 
-void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream)
+void WebPreviewPlugin::FeedVideoToPeers(encoder_packet* pkt, StreamState& stream)
 {
-    const bool isAudio = (pkt->type == OBS_ENCODER_AUDIO);
-    const uint32_t clockRate = isAudio ? 48000u : 90000u;
-    const double ptsSeconds  = static_cast<double>(pkt->pts)
-                             * pkt->timebase_num / pkt->timebase_den;
-    const uint32_t rtpTs     = static_cast<uint32_t>(ptsSeconds * clockRate);
+    const double ptsSeconds = static_cast<double>(pkt->pts)
+                            * pkt->timebase_num / pkt->timebase_den;
+    const uint32_t rtpTs    = static_cast<uint32_t>(ptsSeconds * 90000.0);
 
-    // Diagnostic: flag audio packets whose pts delta isn't the expected
-    // 960 samples (one 20ms Opus frame). A wrong delta means the encoder
-    // is jumping forward or back in its timeline, which the receiver fills
-    // with concealment. Logging is rate-limited so we get a signal, not spam.
-    if (isAudio) {
-        static thread_local int64_t prevPts = -1;
-        static thread_local int     warnRemaining = 0;
-        static thread_local uint64_t lastResetNs = 0;
-        const uint64_t nowNs = os_gettime_ns();
-        if (nowNs - lastResetNs > 5'000'000'000ull) { // every 5s
-            warnRemaining = 5;
-            lastResetNs   = nowNs;
-        }
-        if (prevPts >= 0) {
-            const int64_t dPts = (int64_t)pkt->pts - prevPts;
-            if (dPts != 960 && warnRemaining > 0) {
-                blog(LOG_WARNING,
-                     "[obs-web-preview] audio pts delta=%lld (expected 960) "
-                     "timebase=%d/%d size=%zu",
-                     (long long)dPts, pkt->timebase_num, pkt->timebase_den,
-                     pkt->size);
-                warnRemaining--;
-            }
-        }
-        prevPts = (int64_t)pkt->pts;
-    }
-
-    // Cache video keyframes so new peers receive them immediately on connect.
-    if (!isAudio && pkt->keyframe) {
+    if (pkt->keyframe) {
         std::lock_guard<std::mutex> kfLock(stream.keyframeCache->mutex);
         stream.keyframeCache->data.assign(pkt->data, pkt->data + pkt->size);
         stream.keyframeCache->rtpTimestamp = rtpTs;
@@ -756,36 +779,43 @@ void WebPreviewPlugin::FeedPacketToPool(encoder_packet* pkt, StreamState& stream
 
     std::lock_guard<std::mutex> lock(stream.peersMutex);
     CleanDeadPeers(stream);
-
-    if (stream.activePeers.empty())
-        return;
+    if (stream.activePeers.empty()) return;
 
     auto* bytes = reinterpret_cast<const std::byte*>(pkt->data);
-
     for (auto& peer : stream.activePeers) {
-        if (isAudio) {
-            if (!peer->audioReady || !peer->audioTrack || !peer->audioRtpConfig)
-                continue;
-            try {
-                peer->audioRtpConfig->timestamp = rtpTs;
-                peer->audioTrack->send(bytes, pkt->size);
-            } catch (...) {
-                peer->dead = true;
-            }
-            continue;
-        }
-
-        if (!peer->ready)
-            continue;
-        // After a PLI or on first connect, withhold non-keyframes — a peer that
-        // has lost sync can't decode them and they just waste bandwidth.
-        if (!pkt->keyframe && peer->needsKeyframe.load())
-            continue;
+        if (!peer->ready) continue;
+        // After a PLI or on first connect, withhold non-keyframes — a peer
+        // that has lost sync can't decode them and they just waste bandwidth.
+        if (!pkt->keyframe && peer->needsKeyframe.load()) continue;
         try {
             peer->rtpConfig->timestamp = rtpTs;
             peer->track->send(bytes, pkt->size);
-            if (pkt->keyframe)
-                peer->needsKeyframe.store(false);
+            if (pkt->keyframe) peer->needsKeyframe.store(false);
+        } catch (...) {
+            peer->dead = true;
+        }
+    }
+}
+
+void WebPreviewPlugin::SendAudioToPeers(int idx, const uint8_t* data,
+                                         size_t size, uint32_t rtpTs)
+{
+    // Runs on the AudioPacer's worker thread at the paced wallclock time.
+    if (idx < 0 || idx >= numStreams_) return;
+    auto& stream = streams_[idx];
+    if (!stream.streaming) return;
+
+    std::lock_guard<std::mutex> lock(stream.peersMutex);
+    CleanDeadPeers(stream);
+    if (stream.activePeers.empty()) return;
+
+    auto* bytes = reinterpret_cast<const std::byte*>(data);
+    for (auto& peer : stream.activePeers) {
+        if (!peer->audioReady || !peer->audioTrack || !peer->audioRtpConfig)
+            continue;
+        try {
+            peer->audioRtpConfig->timestamp = rtpTs;
+            peer->audioTrack->send(bytes, size);
         } catch (...) {
             peer->dead = true;
         }

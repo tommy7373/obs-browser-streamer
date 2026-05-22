@@ -11,6 +11,7 @@
 
 namespace httplib { class Server; class Request; class Response; }
 class WebPreviewOutput;
+class AudioPacer;
 
 static constexpr int kMaxStreams = 8;
 
@@ -38,6 +39,7 @@ struct KeyframeCache {
 
 struct StreamState {
     std::unique_ptr<WebPreviewOutput>      output;
+    std::unique_ptr<AudioPacer>            audioPacer;
     std::mutex                             peersMutex;
     std::vector<std::shared_ptr<PeerInfo>> activePeers;
     std::atomic<bool>                      streaming{false};
@@ -93,7 +95,8 @@ private:
     void TryStopServer();
     void RegisterRoutes();
     void HandleOfferRequest(const httplib::Request& req, httplib::Response& res, StreamState& stream);
-    void FeedPacketToPool(encoder_packet* pkt, StreamState& stream);
+    void FeedVideoToPeers(encoder_packet* pkt, StreamState& stream);
+    void SendAudioToPeers(int idx, const uint8_t* data, size_t size, uint32_t rtpTs);
     void CleanDeadPeers(StreamState& stream);
     std::vector<std::string> GetLocalIps();
 };

@@ -339,15 +339,12 @@
       video.play().catch(() => {});
       if (e.track.kind === 'video') setStatus('Live', true);
 
-      // Jitter buffer hint: 300ms for both audio and video. OBS's audio
-      // encoder thread delivers Opus packets in 60-165ms wallclock bursts
-      // (observed in the OBS-side diagnostic log) — anything smaller and
-      // the receiver concealment-pads the gaps. A/V are in one MediaStream
-      // so the browser keeps them in lipsync at the larger of the two
-      // hints; setting both explicitly is just belt-and-suspenders.
+      // 100ms playout hint — measured 300ms didn't reduce concealment so
+      // buffer size isn't the bottleneck. Keep the low-latency default;
+      // audio pacing is handled send-side.
       try {
         pc.getReceivers().forEach(r => {
-          if (r) r.playoutDelayHint = 0.3;
+          if (r) r.playoutDelayHint = 0.1;
         });
       } catch(_) {}
     };
