@@ -164,10 +164,10 @@
     const now = performance.now();
     const dt  = prevTs ? (now - prevTs) / 1000 : 0;
 
-    let inbound = null, track = null, candPair = null, remoteInbound = null;
+    let inbound = null, inboundAudio = null, candPair = null, remoteInbound = null;
     report.forEach(s => {
       if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s;
-      else if (s.type === 'track' && s.kind === 'video') track = s;
+      else if (s.type === 'inbound-rtp' && s.kind === 'audio') inboundAudio = s;
       else if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated) candPair = s;
       else if (s.type === 'remote-inbound-rtp' && s.kind === 'video') remoteInbound = s;
     });
@@ -216,6 +216,36 @@
     lines.push(`dropped    ${dDropped} per s   (total ${inbound.framesDropped||0})`);
     lines.push(`assembled  ${inbound.framesAssembled||inbound.framesReceived||0}`);
     lines.push(`decoder    ${inbound.decoderImplementation||'?'}`);
+
+    if (inboundAudio) {
+      const prevAud = prevReport ? prevReport.get(inboundAudio.id) : null;
+      const aBytes  = prevAud ? (inboundAudio.bytesReceived   - prevAud.bytesReceived)   : 0;
+      const aLost   = prevAud ? (inboundAudio.packetsLost     - prevAud.packetsLost)     : 0;
+      const aRecv   = prevAud ? (inboundAudio.packetsReceived - prevAud.packetsReceived) : 0;
+      const aNack   = prevAud ? ((inboundAudio.nackCount||0)  - (prevAud.nackCount||0))  : 0;
+      const aConceal= prevAud ? ((inboundAudio.concealedSamples||0) - (prevAud.concealedSamples||0)) : 0;
+      const aFec    = prevAud ? ((inboundAudio.fecPacketsReceived||0) - (prevAud.fecPacketsReceived||0)) : 0;
+      const aJb     = inboundAudio.jitterBufferDelay;
+      const aJbCount= inboundAudio.jitterBufferEmittedCount;
+      const prevAJb = prevAud ? prevAud.jitterBufferDelay : 0;
+      const prevAJbC= prevAud ? prevAud.jitterBufferEmittedCount : 0;
+      const aDJbDur = aJb - prevAJb;
+      const aDJbCnt = aJbCount - prevAJbC;
+      const aJbMs   = aDJbCnt > 0 ? (aDJbDur / aDJbCnt * 1000) : 0;
+      const akbps   = dt > 0 ? (aBytes * 8 / 1000 / dt) : 0;
+      const aLossP  = (aRecv + aLost) > 0 ? (aLost / (aRecv + aLost) * 100) : 0;
+      lines.push('');
+      lines.push(`AUDIO`);
+      lines.push(color(`bitrate    ${fmt(akbps,0)} kbps`,
+                       akbps < 16 && dt > 0 ? 'warn' : ''));
+      lines.push(color(`loss       ${fmt(aLossP,1)}%   (${aLost}/${aLost+aRecv})`,
+                       aLossP > 2 ? 'bad' : (aLossP > 0.5 ? 'warn' : '')));
+      lines.push(`jitter buf ${fmt(aJbMs,0)} ms`);
+      lines.push(color(`nack/fec   ${aNack}/${aFec} per s`,
+                       aNack > 5 ? 'warn' : ''));
+      lines.push(color(`concealed  ${aConceal} samples`,
+                       aConceal > 480 ? 'bad' : (aConceal > 0 ? 'warn' : '')));
+    }
 
     statsBox.innerHTML = lines.join('\n');
 
