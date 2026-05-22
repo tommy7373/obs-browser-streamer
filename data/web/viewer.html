@@ -66,22 +66,143 @@
   #rotbtn  { bottom: 20px; right: 20px; }
   #fsbtn   { bottom: 20px; right: 140px; }
   #backbtn { bottom: 20px; left: 20px; font-size: 36px; }
+  #statsbtn{ top: 20px; right: 20px; width: 64px; height: 64px;
+             font-size: 26px; line-height: 64px; }
+
+  #stats {
+    position: fixed;
+    top: 20px; left: 20px;
+    background: rgba(0,0,0,.75);
+    color: #fff;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font: 12px/1.45 ui-monospace, Consolas, monospace;
+    pointer-events: none;
+    z-index: 25;
+    white-space: pre;
+    display: none;
+    min-width: 220px;
+  }
+  #stats.show { display: block; }
+  #stats .warn { color: #ffb84d; }
+  #stats .bad  { color: #ff6b6b; }
 </style>
 </head>
 <body>
 <video id="v" autoplay playsinline muted></video>
 <div id="status">Connecting…</div>
+<div id="stats"></div>
 <button id="backbtn" class="ctrl" title="Back">⬅</button>
 <button id="fsbtn"   class="ctrl" title="Fullscreen">⛶</button>
 <button id="rotbtn"  class="ctrl" title="Rotate">⟳</button>
+<button id="statsbtn" class="ctrl" title="Stats">📊</button>
 
 <script>
 (async function() {
-  const video  = document.getElementById('v');
-  const status = document.getElementById('status');
-  const rotbtn = document.getElementById('rotbtn');
-  const fsbtn  = document.getElementById('fsbtn');
-  const backbtn= document.getElementById('backbtn');
+  const video    = document.getElementById('v');
+  const status   = document.getElementById('status');
+  const rotbtn   = document.getElementById('rotbtn');
+  const fsbtn    = document.getElementById('fsbtn');
+  const backbtn  = document.getElementById('backbtn');
+  const statsbtn = document.getElementById('statsbtn');
+  const statsBox = document.getElementById('stats');
+
+  let statsVisible = false;
+  let statsTimer   = null;
+  let statsPc      = null;
+  let prevReport   = null;
+  let prevTs       = 0;
+
+  statsbtn.addEventListener('click', () => {
+    statsVisible = !statsVisible;
+    statsBox.classList.toggle('show', statsVisible);
+    if (!statsVisible) statsBox.textContent = '';
+  });
+  // Keyboard toggle (desktop convenience)
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 's' || e.key === 'S') statsbtn.click();
+  });
+
+  function fmt(n, d) { return (n === undefined || n === null) ? '—' : n.toFixed(d || 0); }
+  function color(line, cls) { return cls ? `<span class="${cls}">${line}</span>` : line; }
+
+  async function pollStats() {
+    if (!statsPc) return;
+    let report;
+    try { report = await statsPc.getStats(); } catch { return; }
+    const now = performance.now();
+    const dt  = prevTs ? (now - prevTs) / 1000 : 0;
+
+    let inbound = null, track = null, candPair = null, remoteInbound = null;
+    report.forEach(s => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s;
+      else if (s.type === 'track' && s.kind === 'video') track = s;
+      else if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated) candPair = s;
+      else if (s.type === 'remote-inbound-rtp' && s.kind === 'video') remoteInbound = s;
+    });
+
+    if (!inbound) { statsBox.textContent = 'no inbound video yet'; return; }
+
+    const prevIn = prevReport ? prevReport.get(inbound.id) : null;
+    const dBytes   = prevIn ? (inbound.bytesReceived   - prevIn.bytesReceived)   : 0;
+    const dFrames  = prevIn ? (inbound.framesDecoded   - prevIn.framesDecoded)   : 0;
+    const dDropped = prevIn ? ((inbound.framesDropped||0) - (prevIn.framesDropped||0)) : 0;
+    const dLost    = prevIn ? (inbound.packetsLost     - prevIn.packetsLost)     : 0;
+    const dRecv    = prevIn ? (inbound.packetsReceived - prevIn.packetsReceived) : 0;
+    const dNack    = prevIn ? ((inbound.nackCount||0)  - (prevIn.nackCount||0))  : 0;
+    const dPli     = prevIn ? ((inbound.pliCount||0)   - (prevIn.pliCount||0))   : 0;
+    const dKey     = prevIn ? ((inbound.keyFramesDecoded||0) - (prevIn.keyFramesDecoded||0)) : 0;
+    const dFreeze  = prevIn ? ((inbound.freezeCount||0) - (prevIn.freezeCount||0)) : 0;
+    const dFreezeDur = prevIn ? ((inbound.totalFreezesDuration||0) - (prevIn.totalFreezesDuration||0)) : 0;
+
+    const kbps = dt > 0 ? (dBytes * 8 / 1000 / dt) : 0;
+    const fps  = dt > 0 ? (dFrames / dt) : 0;
+    const lossPct = (dRecv + dLost) > 0 ? (dLost / (dRecv + dLost) * 100) : 0;
+
+    const jbDelay = inbound.jitterBufferDelay;
+    const jbCount = inbound.jitterBufferEmittedCount;
+    const prevJbDelay = prevIn ? prevIn.jitterBufferDelay : 0;
+    const prevJbCount = prevIn ? prevIn.jitterBufferEmittedCount : 0;
+    const dJbDelay = jbDelay - prevJbDelay;
+    const dJbCount = jbCount - prevJbCount;
+    const jbMs = dJbCount > 0 ? (dJbDelay / dJbCount * 1000) : 0;
+
+    const rtt = candPair ? candPair.currentRoundTripTime : null;
+    const remoteJitter = remoteInbound ? remoteInbound.jitter : null;
+
+    const lines = [];
+    lines.push(`fps        ${fmt(fps,1)}    ${inbound.frameWidth||0}x${inbound.frameHeight||0}`);
+    lines.push(color(`bitrate    ${fmt(kbps,0)} kbps`, kbps < 100 && dt > 0 ? 'warn' : ''));
+    lines.push(color(`loss       ${fmt(lossPct,1)}%   (${dLost}/${dLost+dRecv})`,
+                     lossPct > 2 ? 'bad' : (lossPct > 0.5 ? 'warn' : '')));
+    lines.push(`jitter buf ${fmt(jbMs,0)} ms`);
+    if (rtt !== null) lines.push(`rtt        ${fmt(rtt*1000,0)} ms`);
+    if (remoteJitter !== null) lines.push(`net jitter ${fmt(remoteJitter*1000,1)} ms`);
+    lines.push(color(`nack/pli   ${dNack}/${dPli} per s`, (dNack > 5 || dPli > 0) ? 'warn' : ''));
+    lines.push(`keyframes  ${dKey} per s   (total ${inbound.keyFramesDecoded||0})`);
+    lines.push(color(`freezes    ${dFreeze} (${fmt(dFreezeDur*1000,0)} ms)`,
+                     dFreeze > 0 ? 'bad' : ''));
+    lines.push(`dropped    ${dDropped} per s   (total ${inbound.framesDropped||0})`);
+    lines.push(`assembled  ${inbound.framesAssembled||inbound.framesReceived||0}`);
+    lines.push(`decoder    ${inbound.decoderImplementation||'?'}`);
+
+    statsBox.innerHTML = lines.join('\n');
+
+    prevReport = report;
+    prevTs = now;
+  }
+
+  function startStatsPolling(pc) {
+    statsPc = pc;
+    prevReport = null;
+    prevTs = 0;
+    if (statsTimer) clearInterval(statsTimer);
+    statsTimer = setInterval(pollStats, 1000);
+  }
+  function stopStatsPolling() {
+    if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    statsPc = null;
+  }
 
   backbtn.addEventListener('click', () => { location.href = '/'; });
 
@@ -127,9 +248,12 @@
     function cleanup(delayMs) {
       if (!alive) return;
       alive = false;
+      stopStatsPolling();
       pc.close();
       setTimeout(connect, delayMs);
     }
+
+    startStatsPolling(pc);
 
     pc.addTransceiver('video', { direction: 'recvonly' });
 
