@@ -104,57 +104,71 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
 
     packetCb_ = std::move(cb);
 
-    source_ = obs_get_source_by_name(sourceName.c_str());
-    if (!source_)
-        return false;
+    const bool isProgram = (sourceName == kProgramSentinel);
+
+    if (!isProgram) {
+        source_ = obs_get_source_by_name(sourceName.c_str());
+        if (!source_)
+            return false;
+    }
 
     obs_video_info ovi = {};
     if (!obs_get_video_info(&ovi)) {
-        obs_source_release(source_);
-        source_ = nullptr;
+        if (source_) { obs_source_release(source_); source_ = nullptr; }
         return false;
     }
 
-    // --- obs_view_t-backed video pipeline ---
-    // The view shares OBS's main canvas video clock and graphics thread, which
-    // means encoders (including obs_nvenc_* and texture-path encoders) treat
-    // it as canvas-equivalent. This replaces the previous video_output_open +
-    // main_render_callback path, which had subtle timing-drift issues until
-    // obs_reset_video() ran.
-    //
-    // Base dimensions track the source's natural size so the source fills the
-    // view's base canvas; output dimensions follow the OBS scaled-resolution
-    // setting (typical canvas downscale path).
-    uint32_t srcW = obs_source_get_width(source_);
-    uint32_t srcH = obs_source_get_height(source_);
-    if (srcW == 0 || srcH == 0) {
-        srcW = ovi.base_width;
-        srcH = ovi.base_height;
-    }
-    ovi.base_width    = srcW;
-    ovi.base_height   = srcH;
-    // Cap output size at base size — there's no point upscaling on the
-    // encoder, the source's native pixels are all we have.
-    if (ovi.output_width  > srcW) ovi.output_width  = srcW;
-    if (ovi.output_height > srcH) ovi.output_height = srcH;
-    renderWidth_  = ovi.output_width;
-    renderHeight_ = ovi.output_height;
+    // Pick the video_t the encoder will be bound to.
+    //   Program mode → obs_get_video() (main canvas, post-transition program
+    //   output — exactly what OBS's own streaming output sees).
+    //   Source mode  → an obs_view_t wrapping the chosen source/scene.
+    // Either way the encoder is paired with a canvas-equivalent video_t, which
+    // is what the rewritten obs_nvenc_* in OBS 31+ requires.
+    video_t* encoderVideo = nullptr;
 
-    view_ = obs_view_create();
-    if (!view_) {
-        obs_source_release(source_);
-        source_ = nullptr;
-        return false;
-    }
-    obs_view_set_source(view_, 0, source_);
-    viewVideo_ = obs_view_add2(view_, &ovi);
-    if (!viewVideo_) {
-        blog(LOG_WARNING, "[obs-web-preview] obs_view_add2 returned null");
-        obs_view_destroy(view_);
-        view_ = nullptr;
-        obs_source_release(source_);
-        source_ = nullptr;
-        return false;
+    if (isProgram) {
+        encoderVideo = obs_get_video();
+        if (!encoderVideo) {
+            blog(LOG_WARNING, "[obs-web-preview] obs_get_video() returned null");
+            return false;
+        }
+        renderWidth_  = ovi.output_width;
+        renderHeight_ = ovi.output_height;
+    } else {
+        // --- obs_view_t-backed video pipeline ---
+        // Base dimensions track the source's natural size so the source fills
+        // the view's base canvas; output dimensions follow the OBS scaled-
+        // resolution setting (typical canvas downscale path).
+        uint32_t srcW = obs_source_get_width(source_);
+        uint32_t srcH = obs_source_get_height(source_);
+        if (srcW == 0 || srcH == 0) {
+            srcW = ovi.base_width;
+            srcH = ovi.base_height;
+        }
+        ovi.base_width    = srcW;
+        ovi.base_height   = srcH;
+        if (ovi.output_width  > srcW) ovi.output_width  = srcW;
+        if (ovi.output_height > srcH) ovi.output_height = srcH;
+        renderWidth_  = ovi.output_width;
+        renderHeight_ = ovi.output_height;
+
+        view_ = obs_view_create();
+        if (!view_) {
+            obs_source_release(source_);
+            source_ = nullptr;
+            return false;
+        }
+        obs_view_set_source(view_, 0, source_);
+        viewVideo_ = obs_view_add2(view_, &ovi);
+        if (!viewVideo_) {
+            blog(LOG_WARNING, "[obs-web-preview] obs_view_add2 returned null");
+            obs_view_destroy(view_);
+            view_ = nullptr;
+            obs_source_release(source_);
+            source_ = nullptr;
+            return false;
+        }
+        encoderVideo = viewVideo_;
     }
 
     // --- Video encoder ---
@@ -199,7 +213,7 @@ bool WebPreviewOutput::Start(const std::string& sourceName,
         TeardownPipeline();
         return false;
     }
-    obs_encoder_set_video(vidEncoder_, viewVideo_);
+    obs_encoder_set_video(vidEncoder_, encoderVideo);
 
     // --- Dummy audio encoder — required by OBS_OUTPUT_AV null output. Its
     // packets are filtered out in HandlePacket; the real audio comes from

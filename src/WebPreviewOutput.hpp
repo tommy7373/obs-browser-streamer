@@ -18,6 +18,12 @@ public:
     // obs_module_load before any WebPreviewOutput instance is created.
     static void RegisterOutputType();
 
+    // Sentinel sourceName value meaning "use OBS's main program/live canvas
+    // output (obs_get_video()) directly, bypassing the obs_view_t wrapper".
+    // Picked up by Start() and surfaced as a special entry in the dock /
+    // settings source dropdowns.
+    static constexpr const char* kProgramSentinel = "__program__";
+
     // encoderId may be any H.264 encoder OBS exposes (obs_x264, obs_nvenc_*,
     // ffmpeg_amf_*, obs_qsv11_h264, etc.). The view-backed video pipeline
     // makes the encoder believe it is paired with the main canvas, so

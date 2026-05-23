@@ -1,5 +1,6 @@
 #include "WebPreviewDock.hpp"
 #include "WebPreviewPlugin.hpp"
+#include "WebPreviewOutput.hpp"
 #include "BrowserStreamerSettings.hpp"
 
 #include <obs-module.h>
@@ -93,6 +94,8 @@ void WebPreviewDock::PopulateTelestratorSources()
     QSignalBlocker blocker(telSourceCombo_);
     telSourceCombo_->clear();
     telSourceCombo_->addItem(obs_module_text("WebPreview.NoSource"), QString());
+    telSourceCombo_->addItem(QString("[Program] OBS Live Output"),
+                             QString(WebPreviewOutput::kProgramSentinel));
 
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
@@ -236,9 +239,14 @@ void WebPreviewDock::UpdateStreamRow(int idx)
     const auto& cfg = plugin_->GetConfig(idx);
     rows_[idx].statusDot->setStyleSheet(streaming ? kDotStreaming : kDotStopped);
     rows_[idx].nameLabel->setText(QString::number(idx + 1));
-    rows_[idx].sourceLabel->setText(cfg.sourceName.empty()
-        ? QString("(no source)")
-        : QString::fromStdString(cfg.sourceName));
+    QString srcText;
+    if (cfg.sourceName.empty())
+        srcText = "(no source)";
+    else if (cfg.sourceName == WebPreviewOutput::kProgramSentinel)
+        srcText = "OBS Live Output";
+    else
+        srcText = QString::fromStdString(cfg.sourceName);
+    rows_[idx].sourceLabel->setText(srcText);
     rows_[idx].startStopBtn->setText(obs_module_text(
         streaming ? "WebPreview.Stop" : "WebPreview.Start"));
 }

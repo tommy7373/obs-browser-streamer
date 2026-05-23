@@ -1,5 +1,6 @@
 #include "BrowserStreamerSettings.hpp"
 #include "WebPreviewPlugin.hpp"
+#include "WebPreviewOutput.hpp"
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -171,6 +172,12 @@ void BrowserStreamerSettings::OnAccepted()
 void BrowserStreamerSettings::PopulateSources(QComboBox* combo, const QString& currentSource)
 {
     combo->clear();
+
+    // OBS's main program/live canvas output — works alongside any regular
+    // source/scene and gives viewers exactly what OBS itself is streaming
+    // (post-transitions, including any program-output overlays).
+    combo->addItem(QString("[Program] OBS Live Output"),
+                   QString(WebPreviewOutput::kProgramSentinel));
 
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
